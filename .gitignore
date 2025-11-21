@@ -1,0 +1,5 @@
+.github/
+tsconfig.json
+.vscode/
+local/
+script-types.d.ts
