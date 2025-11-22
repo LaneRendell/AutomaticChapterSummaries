@@ -1,7 +1,45 @@
-// Chapter Summarize v1.5.1: Uncondense feature
+// Chapter Summarize v1.5.2: Fixed automatic processing behavior
 // At scene breaks, or new chapters this script will use GLM to summarize the content of the previous chapter,
 // add it as Lorebook entry and set it to always on.
 // Includes automatic token management, condensation, automatic change detection, and auto-regeneration.
+
+// CHANGELOG v1.5.2:
+// - [CRITICAL BUG FIX] Fixed automatic chapter processing overriding manual control
+//   * Problem: When pasting a long story, the script would ALWAYS process all chapters automatically,
+//     regardless of auto-detect/auto-regenerate settings
+//   * Root cause: onResponse hook had multi-chapter batch processing that bypassed config settings
+//   * Solution: Removed automatic multi-chapter processing from onResponse hook
+//   * Now respects user's auto-detect/auto-regenerate settings properly
+// - [BEHAVIOR CHANGE] Condensation now only happens via checkTokenBudgetAfterGeneration()
+//   * Removed automatic condensation call from generateChapterSummary()
+//   * Condensation now only triggers when user generates text and exceeds budget
+//   * Gives users manual control when automatic settings are disabled
+// - [NEW FEATURE] Notification modal when auto-detect is ON but auto-regenerate is OFF
+//   * Shows informational modal: "Chapter Summaries Available"
+//   * Lists detected chapters that need summaries
+//   * Provides "Open Panel" button to access Changed Chapters section
+//   * Keeps users informed without forcing automatic processing
+// - [CLEANUP] Removed multiChapterBatchInProgress flag (no longer needed)
+// - [FIX] isFirstChapter now properly set to false after processing chapter 1
+//
+// **New Behavior Summary:**
+// 
+// Config: Both OFF
+//   - User pastes long story → nothing happens automatically
+//   - User hits generate → nothing happens automatically  
+//   - User must manually use "Detect Changes" button
+//   - Condensation only forced when budget exceeded during generation
+//
+// Config: Auto-detect ON, Auto-regenerate OFF
+//   - User pastes long story → nothing happens automatically
+//   - User hits generate → detects chapters, shows notification modal + status panel update
+//   - User manually decides to regenerate from Changed Chapters section
+//   - Condensation only forced when budget exceeded during generation
+//
+// Config: Both ON
+//   - User pastes long story → nothing happens automatically
+//   - User hits generate → detects chapters, auto-regenerates them, informs user
+//   - Condensation happens automatically after auto-regeneration (if needed)
 
 // CHANGELOG v1.5.1:
 // - [NEW FEATURE] Condensed ranges UI section
@@ -328,7 +366,6 @@ let autoRegenerate: boolean;
 // Track background work
 let backgroundSummaryInProgress: boolean = false;
 let batchRegenerationInProgress: boolean = false;
-let multiChapterBatchInProgress: boolean = false;  // v1.5.1: Prevents condensation during multi-chapter batch processing
 
 // Auto-detection state (v1.4.0)
 let generationCounter: number = 0;  // Track non-interactive generations (resets on user action)
@@ -391,6 +428,15 @@ async function storeChapterFingerprint(chapterNumber: number, text: string, isCo
 
     if (DEBUG_MODE) {
         api.v1.log(`Stored fingerprint for chapter ${chapterNumber}: hash=${textHash}`);
+    }
+    
+    // v1.5.2: Set isFirstChapter to false after storing chapter 1 fingerprint
+    if (chapterNumber === 1 && isFirstChapter) {
+        isFirstChapter = false;
+        await api.v1.storyStorage.set("isFirstChapter", false);
+        if (DEBUG_MODE) {
+            api.v1.log("Set isFirstChapter=false after storing chapter 1 fingerprint");
+        }
     }
 }
 
@@ -473,11 +519,57 @@ async function detectChangedChapters(): Promise<ChangedChapter[]> {
     // Get all stored fingerprints
     const fingerprints = await getChapterFingerprints();
 
+    // v1.5.2: If no fingerprints exist, treat all COMPLETE chapters as "new" (needing summaries)
     if (fingerprints.length === 0) {
         if (DEBUG_MODE) {
-            api.v1.log("No stored fingerprints found; nothing to compare.");
+            api.v1.log("No stored fingerprints found; treating all complete chapters as new.");
         }
-        return [];
+        
+        // Only detect complete chapters (chapters with ending breaks)
+        // With 1 break: chapter 1 is complete, chapter 2 is in progress
+        // With 2 breaks: chapters 1-2 are complete, chapter 3 is in progress
+        if (chapterBreakCount === 0) {
+            if (DEBUG_MODE) {
+                api.v1.log("No breaks found - chapter 1 still in progress");
+            }
+            return [];
+        }
+        
+        // Split document into chapters
+        const chapters: string[] = splitIntoChapters(fullText);
+        const newChapters: ChangedChapter[] = [];
+        
+        // Only process complete chapters (those that have an ending break)
+        // Number of complete chapters = number of breaks
+        const completeChapterCount = chapterBreakCount;
+        
+        for (let i = 0; i < completeChapterCount && i < chapters.length; i++) {
+            const chapterNumber = i + 1;
+            const chapterText = chapters[i];
+            const currentHash = hashString(chapterText);
+            const title = extractChapterTitle(chapterText);
+            
+            newChapters.push({
+                chapterNumber,
+                detectedAt: Date.now(),
+                currentHash,
+                storedHash: "", // No previous hash
+                title
+            });
+            
+            if (DEBUG_MODE) {
+                api.v1.log(`Chapter ${chapterNumber} is new (hash: ${currentHash})`);
+            }
+        }
+        
+        if (DEBUG_MODE) {
+            api.v1.log(`=== Detection complete: ${newChapters.length} new chapter(s) found ===`);
+        }
+        
+        // Store new chapters as "changed"
+        await setChangedChapters(newChapters);
+        
+        return newChapters;
     }
 
     // v1.4.1: Log condensed chapter info
@@ -779,20 +871,19 @@ async function regenerateChapter(chapterNumber: number): Promise<void> {
     // Generate new summary
     const chapterTitle: string = title || `Chapter ${chapterNumber}`;
 
-    const summaryPrompt: string = promptString.replace("{chapter_text}", chapterText).replace("{chapter_title}", chapterTitle);
-    const messages: Message[] = [{
+    const message: Message[] = [{
         role: "user",
-        content: summaryPrompt
+        content: `${promptString}${chapterText}`
     }];
 
     const params: GenerationParams = await api.v1.generationParameters.get();
     params.max_tokens = summaryMaxtokens;
 
-    const result: GenerationResponse = await retryableGenerate(messages, params, chapterNumber);
+    const result: GenerationResponse = await retryableGenerate(message, params, chapterNumber);
     const summaryText: string = result.choices[0].text.trim();
 
-    // Create formatted entry text
-    const entryText: string = `Chapter ${chapterNumber}: ${chapterTitle}\nType: chapter\nSummary: ${summaryText}`;
+    // v1.5.2 FIX: Use Format B to match generateChapterSummary
+    const entryText: string = `Chapter ${chapterNumber}\nType: chapter\nTitle: ${chapterTitle}\nSummary: ${summaryText}`;
 
     // Create new lorebook entry
     const newEntryId = api.v1.uuid();
@@ -3775,8 +3866,26 @@ async function autoDetectChanges(): Promise<void> {
         if (autoRegenerate) {
             await autoRegenerateChanges(changedChapters);
         } else {
-            // Just show notification
+            // v1.5.2: Show notification modal when auto-detect is ON but auto-regenerate is OFF
+            // User needs to know chapters are ready to regenerate
             await updateStatusPanel();
+            
+            // Show informational modal
+            api.v1.ui.larry.help({
+                question: `📝 **Chapter Summaries Available**\n\n` +
+                    `Detected ${changedChapters.length} chapter(s) that need summaries:\n${chaptersList}\n\n` +
+                    `You can regenerate them from the **Changed Chapters** section in the panel below.`,
+                options: [
+                    {
+                        text: "Open Panel",
+                        callback: () => api.v1.ui.openPanel("chapter-summaries-panel")
+                    },
+                    {
+                        text: "OK",
+                        callback: () => {}
+                    }
+                ]
+            });
         }
 
     } catch (error) {
@@ -4039,8 +4148,12 @@ async function checkTokenBudgetAfterGeneration(): Promise<void> {
 async function autoRegenerateChanges(changedChapters: ChangedChapter[]): Promise<void> {
     if (DEBUG_MODE) {
         api.v1.log(`=== Auto-Regenerating ${changedChapters.length} Changed Chapters ===`);
-        api.v1.log(`Current generation counter: ${generationCounter}`);
+        api.v1.log(`Current generation counter before reset: ${generationCounter}`);
     }
+    
+    // v1.5.2 FIX: Reset generation counter at start of auto-regeneration batch
+    generationCounter = 0;
+    api.v1.log(`Reset generation counter for auto-regeneration batch`);
 
     // v1.4.1: Check token budget before regenerating
     const shouldProceed = await checkTokenBudgetForAutoRegeneration(changedChapters);
@@ -4125,6 +4238,12 @@ async function autoRegenerateChanges(changedChapters: ChangedChapter[]): Promise
         
         try {
             await checkAndCondenseIfNeeded();
+            
+            // v1.5.2 FIX: Reset generation counter after condensation completes
+            if (DEBUG_MODE && generationCounter > 0) {
+                api.v1.log(`Resetting generation counter after condensation (was ${generationCounter})`);
+            }
+            generationCounter = 0;
         } catch (error) {
             const errorMsg = error instanceof Error ? error.message : String(error);
             api.v1.error("Error during post-regeneration condensation check:", errorMsg);
@@ -4962,6 +5081,12 @@ async function checkAndCondenseIfNeeded(): Promise<void> {
     api.v1.log(`⚠️ Token limit reached: ${currentTokens}/${currentMaxTokens} tokens (threshold: ${threshold})`);
 
     try {
+        // v1.5.2 FIX: Reset generation counter before condensation
+        if (DEBUG_MODE && generationCounter > 0) {
+            api.v1.log(`Resetting generation counter before condensation (was ${generationCounter})`);
+        }
+        generationCounter = 0;
+        
         // Try Level 1: Normal condensation
         await performNormalCondensation();
 
@@ -4974,6 +5099,13 @@ async function checkAndCondenseIfNeeded(): Promise<void> {
 
         // Try Level 2: Aggressive condensation
         api.v1.log("⚠️ Still over budget, attempting aggressive condensation...");
+        
+        // v1.5.2 FIX: Reset generation counter before aggressive condensation
+        if (DEBUG_MODE && generationCounter > 0) {
+            api.v1.log(`Resetting generation counter before aggressive condensation (was ${generationCounter})`);
+        }
+        generationCounter = 0;
+        
         await performAggressiveCondensation();
 
         const tokensAfterLevel2 = await getTotalSummaryTokens();
@@ -4985,6 +5117,13 @@ async function checkAndCondenseIfNeeded(): Promise<void> {
 
         // Try Level 3: Emergency condensation
         api.v1.log("⚠️⚠️ Still over budget, attempting emergency condensation...");
+        
+        // v1.5.2 FIX: Reset generation counter before emergency condensation
+        if (DEBUG_MODE && generationCounter > 0) {
+            api.v1.log(`Resetting generation counter before emergency condensation (was ${generationCounter})`);
+        }
+        generationCounter = 0;
+        
         await performEmergencyCondensation();
 
         const tokensAfterLevel3 = await getTotalSummaryTokens();
@@ -5512,8 +5651,16 @@ async function checkIfSummaryNeeded(recentText: string): Promise<boolean> {
         return false;
     }
 
-    // The chapter to summarize is the one BEFORE the most recent break
-    // (We just finished it by adding a break, now we need to summarize it)
+    // v1.5.2 FIX: Chapter N is ready to summarize when its ending break (break N) exists
+    // Chapter 1 = from start to first *** → ready when 1st break exists
+    // Chapter 2 = from first *** to second *** → ready when 2nd break exists
+    // Chapter 3 = from second *** to third *** → ready when 3rd break exists
+    
+    // With 1 break: Chapter 1 complete, chapter 2 in progress → summarize chapter 1
+    // With 2 breaks: Chapters 1-2 complete, chapter 3 in progress → summarize chapter 2
+    // With 3 breaks: Chapters 1-3 complete, chapter 4 in progress → summarize chapter 3
+    
+    // The chapter to summarize = the number of breaks
     const chapterToSummarize = chapterBreakCount;
 
     // Check if we're currently processing this chapter
@@ -5759,6 +5906,15 @@ async function generateChapterSummary(chapterData: { text: string; title: string
         // Mark as successfully processed
         await api.v1.storyStorage.set("lastProcessedChapterCount", pendingChapter);
         await api.v1.storyStorage.remove("pendingChapter");
+        
+        // v1.5.2: Set isFirstChapter to false after successfully processing first chapter
+        if (isFirstChapter && pendingChapter === 1) {
+            isFirstChapter = false;
+            await api.v1.storyStorage.set("isFirstChapter", false);
+            if (DEBUG_MODE) {
+                api.v1.log("Set isFirstChapter=false after processing chapter 1");
+            }
+        }
 
         // Clear from failed list if it was there
         await clearFailedChapter(pendingChapter);
@@ -5769,14 +5925,9 @@ async function generateChapterSummary(chapterData: { text: string; title: string
         // Update UI
         await updateStatusPanel();
 
-        // Check if we need to condense summaries
-        // Skip during multi-chapter batch processing to prevent fragmented condensation
-        if (!multiChapterBatchInProgress) {
-            api.v1.log("Checking if condensation is needed...");
-            await checkAndCondenseIfNeeded();
-        } else if (DEBUG_MODE) {
-            api.v1.log("Skipping condensation check (multi-chapter batch in progress)");
-        }
+        // v1.5.2 FIX: Don't automatically check condensation here
+        // Condensation should only happen via checkTokenBudgetAfterGeneration() (when user generates text)
+        // This allows manual control when auto-settings are disabled
 
     } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
@@ -5844,7 +5995,42 @@ const onResponseHook: OnResponse = async (params) => {
         const sections: DocumentSections = await api.v1.document.scan();
         const fullText = sections.map(s => s.section.text).join('\n');
 
-        const needsSummary = await checkIfSummaryNeeded(fullText);
+        // v1.5.2 FIX: Only automatically process new chapters based on config settings
+        // Manual mode (both OFF): User must click "Check for Changes"
+        // Semi-auto mode (detect ON, regen OFF): Detect changes, notify user, manual regeneration
+        // Full auto mode (both ON): Detect and automatically regenerate
+        let needsSummary = await checkIfSummaryNeeded(fullText);
+        
+        if (needsSummary && !autoDetectOnGeneration) {
+            if (DEBUG_MODE) {
+                api.v1.log("Summary needed but auto-detect is disabled - skipping automatic processing");
+                api.v1.log("User must manually click 'Check for Changes' to detect chapters");
+            }
+            needsSummary = false; // Skip all automatic processing when auto-detect is OFF
+        }
+        
+        // v1.5.2 FIX: In semi-auto mode (detect ON, regen OFF), don't automatically generate
+        // The auto-detection system will handle detection and notification
+        if (needsSummary && autoDetectOnGeneration && !autoRegenerate) {
+            if (DEBUG_MODE) {
+                api.v1.log("Summary needed but auto-regenerate is disabled - skipping automatic generation");
+                api.v1.log("Auto-detection system will detect and notify user");
+            }
+            needsSummary = false; // Skip automatic generation in semi-auto mode
+        }
+        
+        // v1.5.2 FIX: In full auto mode, if no fingerprints exist yet (pasted story),
+        // skip single-chapter generation and let auto-detection handle all chapters
+        if (needsSummary && autoDetectOnGeneration && autoRegenerate) {
+            const fingerprints = await getChapterFingerprints();
+            if (fingerprints.length === 0) {
+                if (DEBUG_MODE) {
+                    api.v1.log("No fingerprints exist yet - skipping single-chapter generation");
+                    api.v1.log("Auto-detection will handle all chapters in batch");
+                }
+                needsSummary = false; // Let auto-detection handle the batch
+            }
+        }
 
         if (needsSummary) {
             api.v1.log("Summary needed - scheduling generation to run after hook completes...");
@@ -5872,73 +6058,10 @@ const onResponseHook: OnResponse = async (params) => {
                     const freshSections = await api.v1.document.scan();
                     const fullText = freshSections.map(s => s.section.text).join('\n');
                     
-                    // BUG FIX v1.5.1: If isFirstChapter is true, process ALL existing chapters
-                    if (isFirstChapter) {
-                        // Set isFirstChapter=false NOW before the loop starts
-                        // This prevents each generateChapterSummary call from resetting pendingChapter to 1
-                        isFirstChapter = false;
-                        await api.v1.storyStorage.set("isFirstChapter", false);
-                        if (DEBUG_MODE) {
-                            api.v1.log("Set isFirstChapter=false before multi-chapter processing");
-                        }
-                        
-                        // Set batch processing flag to prevent condensation during the loop
-                        multiChapterBatchInProgress = true;
-                        if (DEBUG_MODE) {
-                            api.v1.log("Set multiChapterBatchInProgress=true to prevent fragmented condensation");
-                        }
-                        
-                        const chapters = splitIntoChapters(fullText);
-                        api.v1.log(`Processing ${chapters.length} existing chapters`);
-                        
-                        for (let i = 0; i < chapters.length; i++) {
-                            // Check generation limit BEFORE attempting generation
-                            if (generationCounter >= 4) {
-                                // Show modal asking if user wants to continue
-                                if (DEBUG_MODE) {
-                                    api.v1.log(`Generation counter at ${generationCounter} - showing limit modal`);
-                                }
-                                
-                                const remainingCount = chapters.length - i;
-                                const shouldContinue = await showMultiChapterLimitModal(remainingCount, i + 1, chapters.length);
-                                
-                                if (!shouldContinue) {
-                                    // User chose "Skip for Now" - stop processing
-                                    if (DEBUG_MODE) {
-                                        api.v1.log(`User chose to skip remaining chapters. Processed ${i} of ${chapters.length}.`);
-                                    }
-                                    break;
-                                }
-                                
-                                // User chose continue - reset counter
-                                if (DEBUG_MODE) {
-                                    api.v1.log(`User chose to continue. Resetting counter and processing remaining ${remainingCount} chapters.`);
-                                }
-                                generationCounter = 0;
-                            }
-                            
-                            const chapterText = chapters[i];
-                            if (!chapterText || chapterText.trim().length === 0) continue;
-                            
-                            const chapterNumber = i + 1;
-                            const title = extractChapterTitle(chapterText);
-                            
-                            // Set pendingChapter so generateChapterSummary uses the correct number
-                            await api.v1.storyStorage.set("pendingChapter", chapterNumber);
-                            await generateChapterSummary({ text: chapterText, title });
-                            await api.v1.timers.sleep(500);
-                        }
-                        
-                        // Clear batch flag and condense once at the end
-                        multiChapterBatchInProgress = false;
-                        if (DEBUG_MODE) {
-                            api.v1.log("Multi-chapter batch complete. Checking condensation once...");
-                        }
-                        await checkAndCondenseIfNeeded();
-                    } else {
-                        const previousChapter = await scanForPreviousChapter(freshSections);
-                        await generateChapterSummary(previousChapter);
-                    }
+                    // v1.5.2 FIX: Only process the most recent chapter
+                    // Multi-chapter detection should happen via auto-detect system, not automatic processing
+                    const previousChapter = await scanForPreviousChapter(freshSections);
+                    await generateChapterSummary(previousChapter);
 
                 } catch (error) {
                     const errorMsg = error instanceof Error ? error.message : String(error);
@@ -5946,7 +6069,6 @@ const onResponseHook: OnResponse = async (params) => {
                 } finally {
                     // NEW in v1.2.1: Always clear flags when done
                     backgroundSummaryInProgress = false;
-                    multiChapterBatchInProgress = false;  // v1.5.1: Ensure batch flag is cleared on error
                     await updateStatusPanel();
                 }
             }, 1000); // 1 second delay - editor should unblock immediately after hook completes
@@ -5972,25 +6094,22 @@ const onResponseHook: OnResponse = async (params) => {
 
         // v1.4.0: Trigger auto-detection whenever there are chapters with summaries
         // This catches changes to existing chapters even when continuing past the last chapter
+        // v1.5.2: Also detects NEW chapters (when no fingerprints exist yet)
         const chapters = fullText.split(new RegExp(`(?:^|\\n)\\s*${chapterBreakToken.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*(?=\\n|$)`, 'gm'));
         const chapterBreakCount = chapters.length - 1;
 
         // Only run auto-detection if:
         // 1. There are existing chapters (breaks > 0)
         // 2. Auto-detect on generation is enabled
-        // 3. At least one chapter has a fingerprint (something to compare against)
         if (chapterBreakCount > 0 && autoDetectOnGeneration) {
-            const fingerprints: ChapterFingerprint[] = await api.v1.storyStorage.get("chapterFingerprints") || [];
-            if (fingerprints.length > 0) {
-                // Schedule auto-detection after hook completes
-                const delay = needsSummary ? 3000 : 2000; // Longer delay if summary is generating
-                await api.v1.timers.setTimeout(async () => {
-                    if (DEBUG_MODE) {
-                        api.v1.log(needsSummary ? "Running auto-detection after new chapter summary..." : "Running auto-detection after generation...");
-                    }
-                    await autoDetectChanges();
-                }, delay);
-            }
+            // Schedule auto-detection after hook completes
+            const delay = needsSummary ? 3000 : 2000; // Longer delay if summary is generating
+            await api.v1.timers.setTimeout(async () => {
+                if (DEBUG_MODE) {
+                    api.v1.log(needsSummary ? "Running auto-detection after new chapter summary..." : "Running auto-detection after generation...");
+                }
+                await autoDetectChanges();
+            }, delay);
         }
     }
 };
