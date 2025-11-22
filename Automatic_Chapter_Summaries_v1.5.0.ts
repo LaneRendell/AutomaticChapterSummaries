@@ -1,7 +1,28 @@
-// Chapter Summarize v1.4.1: Bug fixes and safety enhancements
+// Chapter Summarize v1.5.0: Enhanced backup browser
 // At scene breaks, or new chapters this script will use GLM to summarize the content of the previous chapter,
 // add it as Lorebook entry and set it to always on.
 // Includes automatic token management, condensation, automatic change detection, and auto-regeneration.
+
+// CHANGELOG v1.5.0:
+// - [NEW FEATURE] Comprehensive backup browser
+//   * New viewBackupDetails() function shows complete backup information
+//   * View all lorebook entries in a backup with inline text display and token counts
+//   * Full entry text displayed inline (selectable for manual copying)
+//   * Metadata display: fingerprints, changed chapters, condensed ranges, failed chapters, last processed chapter
+// - [NEW FEATURE] Enhanced backup list modal
+//   * Shows token count and entry count per backup
+//   * [View Details] button per backup for comprehensive view
+//   * Maintains existing [Restore] functionality
+// - [NEW FEATURE] Configurable backup retention
+//   * New config option: maxRebuildBackups (default: 5, range: 1-20)
+//   * Controls how many backups are kept in storage
+//   * Older backups automatically pruned
+// - [IMPROVEMENT] calculateBackupTokens() helper function
+//   * Accurately calculates total token count for any backup
+//   * Used in backup list display for quick overview
+// - [TECHNICAL] Modal navigation uses modal.closed.then() pattern for proper chaining
+//   * NovelAI modal system requires this pattern for sequential modal displays
+//   * Simplified implementation with inline text display (no nested modals)
 
 // CHANGELOG v1.4.1:
 // - [BUG FIX] Full rebuild now respects 5-generation limit
@@ -134,8 +155,6 @@
 // - Added extra editor ready check in scheduled generation
 
 // TODO: Add ability to view archived summaries
-// TODO: Phase 2-4 of retroactive updates (automatic detection, full rebuild, etc.)
-// KNOWN LIMITATIONS: Phase 1 only detects changes in existing chapters. Adding/removing chapter breaks retroactively requires "Rebuild All" (Phase 3, not yet implemented).
 
 // Typedefs
 type DocumentSections = { sectionId: number; section: Section; index: number }[];
@@ -249,7 +268,7 @@ let recentChaptersToKeep: number;
 let chaptersPerCondensedGroup: number;
 
 // Rebuild config
-let maxRebuildBackups: number;
+let maxRebuildBackups: number;  // v1.5.0: Now configurable via config schema
 
 // Auto-detection config (v1.4.0)
 let autoDetectOnGeneration: boolean;
@@ -1377,6 +1396,262 @@ async function restoreFromBackup(backup: RebuildBackup): Promise<void> {
 }
 
 // ============================================================================
+// BACKUP VIEWING FUNCTIONS (v1.5.0)
+// ============================================================================
+
+/**
+ * Calculate total token count for all entries in a backup
+ * v1.5.0: Helper function for backup browser
+ * 
+ * @param backup RebuildBackup The backup to calculate tokens for
+ * @returns Promise<number> Total token count
+ */
+async function calculateBackupTokens(backup: RebuildBackup): Promise<number> {
+    let total: number = 0;
+    
+    for (const entry of backup.entries) {
+        if (entry.text) {
+            try {
+                const tokens = await api.v1.tokenizer.encode(entry.text, "glm-4-6");
+                total += tokens.length;
+            } catch (error) {
+                if (DEBUG_MODE) {
+                    api.v1.log(`Warning: Could not tokenize entry ${entry.id}`);
+                }
+            }
+        }
+    }
+    
+    return total;
+}
+
+/**
+ * View comprehensive details for a specific backup
+ * v1.5.0: Shows all entries with inline text display, metadata, and restore option
+ * 
+ * @param backup RebuildBackup The backup to display details for
+ * @returns Promise<void>
+ */
+async function viewBackupDetails(backup: RebuildBackup): Promise<void> {
+    try {
+        api.v1.log(`[v1.5.0] Opening backup details for: ${backup.reason} (${new Date(backup.timestamp).toLocaleString()})`);
+
+        // Calculate token count
+        const tokenCount: number = await calculateBackupTokens(backup);
+        api.v1.log(`[v1.5.0] Token count calculated: ${tokenCount}`);
+
+    // Build header
+    let headerText: string = `**Backup Information**\n\n`;
+    headerText += `📅 **Created:** ${new Date(backup.timestamp).toLocaleString()}\n`;
+    headerText += `📝 **Reason:** ${backup.reason}\n`;
+    headerText += `📊 **Total Tokens:** ${tokenCount}\n`;
+    headerText += `📚 **Total Entries:** ${backup.entries.length}\n\n`;
+
+    // Build metadata section
+    let metadataText: string = `**Metadata:**\n`;
+    metadataText += `• Fingerprints: ${backup.fingerprints.length}\n`;
+    metadataText += `• Changed Chapters: ${backup.changedChapters.length}\n`;
+    metadataText += `• Condensed Ranges: ${backup.condensedRanges.length}\n`;
+    metadataText += `• Failed Chapters: ${backup.failedChapters.length}\n`;
+    metadataText += `• Last Processed Chapter: ${backup.lastProcessedChapterCount}\n`;
+    metadataText += `• Is First Chapter: ${backup.isFirstChapter ? "Yes" : "No"}\n\n`;
+
+    // Build entry list (sorted by chapter number)
+    const entryList: any[] = [];
+
+    // Parse and sort entries
+    const parsedEntries: { chapterNum: number; entry: LorebookEntry }[] = [];
+    
+    for (const entry of backup.entries) {
+        if (!entry.text) continue;
+        
+        // Try to extract chapter number from text
+        const chapterMatch = entry.text.match(/^Chapters? (\d+)(?:-(\d+))?/);
+        if (chapterMatch) {
+            const startChapter: number = parseInt(chapterMatch[1]);
+            parsedEntries.push({ chapterNum: startChapter, entry });
+        } else {
+            // Fallback: try to extract from displayName
+            const nameMatch = entry.displayName?.match(/Chapter (\d+)/);
+            if (nameMatch) {
+                parsedEntries.push({ chapterNum: parseInt(nameMatch[1]), entry });
+            } else {
+                // Last resort: add to end
+                parsedEntries.push({ chapterNum: 999999, entry });
+            }
+        }
+    }
+
+    // Sort by chapter number
+    parsedEntries.sort((a, b) => a.chapterNum - b.chapterNum);
+
+    // Build UI elements for each entry
+    api.v1.log(`[v1.5.0] Building entry list for ${parsedEntries.length} entries`);
+    
+    entryList.push({
+        type: "text",
+        text: `**Lorebook Entries (${backup.entries.length}):**`,
+        markdown: true,
+        style: { marginTop: "16px", marginBottom: "8px", fontWeight: "bold" }
+    });
+
+    for (const { entry } of parsedEntries) {
+        const entryTokens = entry.text ? (await api.v1.tokenizer.encode(entry.text, "glm-4-6")).length : 0;
+        const displayName = entry.displayName || "Untitled Entry";
+        api.v1.log(`[v1.5.0] Processing entry: ${displayName}`);
+        
+        // Simplified: Just show entry name without View button for now
+        entryList.push({
+            type: "text",
+            text: `• ${displayName} (${entryTokens} tokens)\n${entry.text}`,
+            markdown: true,
+            style: { marginBottom: "4px", padding: "8px", backgroundColor: "#2a2a2a", borderRadius: "4px" }
+        });
+    }
+
+    // Create new modal with backup details
+    api.v1.log(`[v1.5.0] Creating details modal with ${entryList.length} entry items`);
+    
+    // Build content array
+    const content: UIPart[] = [
+        // Back button
+        {
+            type: "button",
+            text: "← Back to List",
+            iconId: "chevron-left",
+            callback: () => {
+                modal.close();
+                modal.closed.then(() => {
+                    showBackupModal();
+                });
+            },
+            style: { marginBottom: "16px" }
+        },
+        // Header and metadata
+        {
+            type: "text",
+            text: headerText + metadataText,
+            markdown: true,
+            style: { marginBottom: "16px" }
+        },
+        // Entries header
+        {
+            type: "text",
+            text: "**Entries:**",
+            markdown: true,
+            style: { marginTop: "16px" }
+        },
+        // Entries list
+        {
+            type: "column",
+            content: entryList,
+            style: {
+                maxHeight: "400px",
+                overflowY: "auto",
+                padding: "8px",
+                border: "1px solid #3a3a3a",
+                borderRadius: "4px"
+            }
+        },
+        // Bottom buttons
+        {
+            type: "row",
+            spacing: "end",
+            content: [
+                {
+                    type: "button",
+                    text: "Close",
+                    iconId: "x",
+                    callback: () => {
+                        modal.close();
+                    },
+                    style: { marginRight: "8px" }
+                },
+                {
+                    type: "button",
+                    text: "Restore This Backup",
+                    iconId: "refresh",
+                    callback: () => {
+                        modal.close();
+                        modal.closed.then(() => {
+                            // Open confirmation modal
+                            const confirmModal = api.v1.ui.modal.open({
+                                title: "⚠️ Confirm Restore",
+                                size: "medium",
+                                content: [
+                                    {
+                                        type: "text",
+                                        text: `**Are you sure you want to restore this backup?**\n\nThis will replace all current chapter summaries with the backup from:\n\n📅 ${new Date(backup.timestamp).toLocaleString()}\n📝 ${backup.reason}\n\n⚠️ **Warning:** Your current summaries will be lost unless you create a new backup first.`,
+                                        markdown: true
+                                    },
+                                    {
+                                        type: "row",
+                                        spacing: "end",
+                                        content: [
+                                            {
+                                                type: "button",
+                                                text: "Cancel",
+                                                iconId: "x",
+                                                callback: () => {
+                                                    confirmModal.close();
+                                                    confirmModal.closed.then(() => {
+                                                        viewBackupDetails(backup);
+                                                    });
+                                                }
+                                            },
+                                            {
+                                                type: "button",
+                                                text: "Yes, Restore",
+                                                iconId: "check",
+                                                callback: async () => {
+                                                    confirmModal.close();
+                                                    
+                                                    try {
+                                                        await restoreFromBackup(backup);
+                                                        api.v1.ui.larry.help({
+                                                            question: `✓ Successfully restored backup from ${new Date(backup.timestamp).toLocaleString()}`,
+                                                            options: [{ text: "OK", callback: () => {} }]
+                                                        });
+                                                    } catch (error: any) {
+                                                        api.v1.ui.larry.help({
+                                                            question: `Failed to restore backup: ${error instanceof Error ? error.message : String(error)}`,
+                                                            options: [{ text: "OK", callback: () => {} }]
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        ],
+                                        style: { marginTop: "16px" }
+                                    }
+                                ]
+                            });
+                        });
+                    }
+                }
+            ],
+            style: { marginTop: "16px" }
+        }
+    ];
+    
+    const modal = api.v1.ui.modal.open({
+        title: `📦 Backup Details: ${backup.reason}`,
+        size: "large",
+        content: content
+    });
+    
+    api.v1.log(`[v1.5.0] Details modal created successfully`);
+    
+    } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        api.v1.error("[v1.5.0] Failed to show backup details:", errorMsg);
+        api.v1.ui.larry.help({
+            question: `Failed to display backup details: ${errorMsg}`,
+            options: [{ text: "OK", callback: () => {} }]
+        });
+    }
+}
+
+// ============================================================================
 // REBUILD CATEGORY MANAGEMENT FUNCTIONS (Phase 3 Step 3)
 // ============================================================================
 
@@ -2130,6 +2405,200 @@ async function handleRebuildFailure(
 }
 
 /**
+ * v1.5.0: Build the UI content for the backup list
+ * Extracted as a separate function so it can be reused by the "Back" button
+ */
+async function buildBackupListContent(backups: RebuildBackup[], modalRef: { modal?: any }): Promise<UIPart[]> {
+    const modalContent: UIPart[] = [];
+    
+    // Header text
+    modalContent.push({
+        type: "text",
+        text: `**Available Backups (${backups.length}):**\n\nSelect a backup to restore. This will replace ALL current summaries with the backup state.`,
+        markdown: true,
+        style: { marginBottom: "16px" }
+    });
+
+    // Individual backup entries with restore buttons
+    // v1.5.0: Calculate token counts for each backup
+    const tokenCounts: number[] = [];
+    for (const backup of backups) {
+        tokenCounts.push(await calculateBackupTokens(backup));
+    }
+    
+    backups.forEach((backup, index) => {
+        const date = new Date(backup.timestamp).toLocaleString();
+        const tokens = tokenCounts[index];
+        
+        // Separator
+        if (index > 0) {
+            modalContent.push({
+                type: "container",
+                style: {
+                    borderTop: "1px solid rgba(255, 255, 255, 0.2)",
+                    marginTop: "12px",
+                    marginBottom: "12px"
+                },
+                content: []
+            });
+        }
+        
+        // Backup info (v1.5.0: added token count)
+        modalContent.push({
+            type: "text",
+            text: `**Backup ${index + 1}**\n` +
+                  `📅 ${date}\n` +
+                  `📝 Reason: ${backup.reason}\n` +
+                  `📊 Chapters: ${backup.chapterCount}\n` +
+                  `📦 Entries: ${backup.entries.length}\n` +
+                  `🔢 Tokens: ${tokens}`,
+            markdown: true,
+            style: { marginBottom: "8px" }
+        });
+        
+        // v1.5.0: Action buttons row (View Details + Restore)
+        modalContent.push({
+            type: "row",
+            spacing: "start",
+            content: [
+                {
+                    type: "button",
+                    text: "View Details",
+                    iconId: "eye",
+                    callback: () => {
+                        const currentModal = modalRef.modal!;
+                        api.v1.log(`[v1.5.0] Closing list modal...`);
+                        currentModal.close();
+                        currentModal.closed.then(async () => {
+                            api.v1.log(`[v1.5.0] List modal closed, opening details...`);
+                            try {
+                                await viewBackupDetails(backup);
+                            } catch (error: any) {
+                                api.v1.error(`[v1.5.0] Error opening details:`, error);
+                            }
+                        }).catch((error: any) => {
+                            api.v1.error(`[v1.5.0] Error in closed promise:`, error);
+                        });
+                    },
+                    style: { marginRight: "8px" }
+                },
+                {
+                    type: "button",
+                    text: `Restore`,
+                    iconId: "refresh",
+                    callback: async () => {
+                        // Close current modal
+                        modalRef.modal!.close();
+                        
+                        // Open confirmation modal
+                        const confirmModal = api.v1.ui.modal.open({
+                            title: "⚠️ Confirm Restore",
+                            size: "medium",
+                            content: [
+                                {
+                                    type: "text",
+                                    text: `**Restore backup from ${date}?**\n\nThis will:\n- Delete ALL current summaries\n- Restore ${backup.entries.length} entries\n- Restore all state from backup\n\n⚠️ **This action cannot be undone!**`,
+                                    markdown: true,
+                                    style: { marginBottom: "16px" }
+                                },
+                                {
+                                    type: "row",
+                                    spacing: "end",
+                                    content: [
+                                        {
+                                            type: "button",
+                                            text: "Cancel",
+                                            iconId: "x",
+                                            callback: () => {
+                                                if (DEBUG_MODE) {
+                                                    api.v1.log("Restore cancelled by user");
+                                                }
+                                                confirmModal.close();
+                                                // Reopen backup list modal
+                                                showBackupModal();
+                                            },
+                                            style: { marginRight: "8px" }
+                                        },
+                                        {
+                                            type: "button",
+                                            text: "Yes, Restore",
+                                            iconId: "check",
+                                            callback: async () => {
+                                                try {
+                                                    confirmModal.close();
+                                                    
+                                                    // Show restoring message
+                                                    await api.v1.ui.updateParts([{
+                                                        id: "retry-status",
+                                                        text: "🔄 Restoring backup..."
+                                                    }]);
+                                                    
+                                                    // Perform restore
+                                                    await restoreFromBackup(backup);
+                                                    
+                                                    // Success message
+                                                    await api.v1.ui.updateParts([{
+                                                        id: "retry-status",
+                                                        text: `✅ Backup restored successfully! Restored ${backup.entries.length} entries.`
+                                                    }]);
+                                                    
+                                                    // Clear message after delay
+                                                    await api.v1.timers.sleep(4000);
+                                                    await api.v1.ui.updateParts([{
+                                                        id: "retry-status",
+                                                        text: ""
+                                                    }]);
+                                                    
+                                                } catch (error) {
+                                                    const errorMsg = error instanceof Error ? error.message : String(error);
+                                                    api.v1.error("Failed to restore backup:", errorMsg);
+                                                    
+                                                    await api.v1.ui.updateParts([{
+                                                        id: "retry-status",
+                                                        text: `❌ Restore failed: ${errorMsg}`
+                                                    }]);
+                                                }
+                                            }
+                                        }
+                                    ]
+                                }
+                            ]
+                        });
+                    }
+                }
+            ],
+            style: { marginBottom: "12px" }
+        });
+    });
+
+    // Close button at bottom
+    modalContent.push({
+        type: "container",
+        style: {
+            borderTop: "2px solid rgba(255, 255, 255, 0.3)",
+            marginTop: "16px",
+            paddingTop: "16px"
+        },
+        content: [
+            {
+                type: "row",
+                spacing: "end",
+                content: [
+                    {
+                        type: "button",
+                        text: "Close",
+                        iconId: "x",
+                        callback: () => modalRef.modal!.close()
+                    }
+                ]
+            }
+        ]
+    });
+    
+    return modalContent;
+}
+
+/**
  * Show a modal with list of available backups and restore options
  */
 async function showBackupModal(): Promise<void> {
@@ -2149,160 +2618,14 @@ async function showBackupModal(): Promise<void> {
             return;
         }
 
-        // Build modal content with restore buttons
-        const modalContent: UIPart[] = [];
+        // Create modal wrapper object so callbacks can reference it before it's created
+        const modalRef: { modal?: any } = {};
         
-        // Header text
-        modalContent.push({
-            type: "text",
-            text: `**Available Backups (${backups.length}):**\n\nSelect a backup to restore. This will replace ALL current summaries with the backup state.`,
-            markdown: true,
-            style: { marginBottom: "16px" }
-        });
-
-        // Individual backup entries with restore buttons
-        backups.forEach((backup, index) => {
-            const date = new Date(backup.timestamp).toLocaleString();
-            
-            // Separator
-            if (index > 0) {
-                modalContent.push({
-                    type: "container",
-                    style: {
-                        borderTop: "1px solid rgba(255, 255, 255, 0.2)",
-                        marginTop: "12px",
-                        marginBottom: "12px"
-                    },
-                    content: []
-                });
-            }
-            
-            // Backup info
-            modalContent.push({
-                type: "text",
-                text: `**Backup ${index + 1}**\n` +
-                      `📅 ${date}\n` +
-                      `📝 Reason: ${backup.reason}\n` +
-                      `📊 Chapters: ${backup.chapterCount}\n` +
-                      `📦 Entries: ${backup.entries.length}`,
-                markdown: true,
-                style: { marginBottom: "8px" }
-            });
-            
-            // Restore button - opens confirmation modal
-            modalContent.push({
-                type: "button",
-                text: `Restore Backup ${index + 1}`,
-                iconId: "refresh",
-                callback: async () => {
-                    // Close current modal
-                    modal.close();
-                    
-                    // Open confirmation modal
-                    const confirmModal = api.v1.ui.modal.open({
-                        title: "⚠️ Confirm Restore",
-                        size: "medium",
-                        content: [
-                            {
-                                type: "text",
-                                text: `**Restore backup from ${date}?**\n\nThis will:\n- Delete ALL current summaries\n- Restore ${backup.entries.length} entries\n- Restore all state from backup\n\n⚠️ **This action cannot be undone!**`,
-                                markdown: true,
-                                style: { marginBottom: "16px" }
-                            },
-                            {
-                                type: "row",
-                                spacing: "end",
-                                content: [
-                                    {
-                                        type: "button",
-                                        text: "Cancel",
-                                        iconId: "x",
-                                        callback: () => {
-                                            if (DEBUG_MODE) {
-                                                api.v1.log("Restore cancelled by user");
-                                            }
-                                            confirmModal.close();
-                                            // Reopen backup list modal
-                                            showBackupModal();
-                                        },
-                                        style: { marginRight: "8px" }
-                                    },
-                                    {
-                                        type: "button",
-                                        text: "Yes, Restore",
-                                        iconId: "check",
-                                        callback: async () => {
-                                            try {
-                                                confirmModal.close();
-                                                
-                                                // Show restoring message
-                                                await api.v1.ui.updateParts([{
-                                                    id: "retry-status",
-                                                    text: "🔄 Restoring backup..."
-                                                }]);
-                                                
-                                                // Perform restore
-                                                await restoreFromBackup(backup);
-                                                
-                                                // Success message
-                                                await api.v1.ui.updateParts([{
-                                                    id: "retry-status",
-                                                    text: `✅ Backup restored successfully! Restored ${backup.entries.length} entries.`
-                                                }]);
-                                                
-                                                // Clear message after delay
-                                                await api.v1.timers.sleep(4000);
-                                                await api.v1.ui.updateParts([{
-                                                    id: "retry-status",
-                                                    text: ""
-                                                }]);
-                                                
-                                            } catch (error) {
-                                                const errorMsg = error instanceof Error ? error.message : String(error);
-                                                api.v1.error("Failed to restore backup:", errorMsg);
-                                                
-                                                await api.v1.ui.updateParts([{
-                                                    id: "retry-status",
-                                                    text: `❌ Restore failed: ${errorMsg}`
-                                                }]);
-                                            }
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    });
-                },
-                style: { marginBottom: "12px" }
-            });
-        });
-
-        // Close button at bottom
-        modalContent.push({
-            type: "container",
-            style: {
-                borderTop: "2px solid rgba(255, 255, 255, 0.3)",
-                marginTop: "16px",
-                paddingTop: "16px"
-            },
-            content: [
-                {
-                    type: "row",
-                    spacing: "end",
-                    content: [
-                        {
-                            type: "button",
-                            text: "Close",
-                            iconId: "x",
-                            callback: () => modal.close()
-                        }
-                    ]
-                }
-            ]
-        });
-
-        // Create modal
-        const modal = api.v1.ui.modal.open({
+        // Build modal content first (v1.5.0: use extracted function)
+        const modalContent: UIPart[] = await buildBackupListContent(backups, modalRef);
+        
+        // Create modal with content
+        modalRef.modal = api.v1.ui.modal.open({
             title: "📦 Storage Backups",
             size: "large",
             content: modalContent
