@@ -1,7 +1,51 @@
-// Chapter Summarize v1.5.0: Enhanced backup browser
+// Chapter Summarize v1.5.1: Uncondense feature
 // At scene breaks, or new chapters this script will use GLM to summarize the content of the previous chapter,
 // add it as Lorebook entry and set it to always on.
 // Includes automatic token management, condensation, automatic change detection, and auto-regeneration.
+
+// CHANGELOG v1.5.1:
+// - [NEW FEATURE] Condensed ranges UI section
+//   * New buildCondensedRangesUI() function displays all current condensed ranges
+//   * Shows range details: chapter span, token count, condensation date, original summaries count
+//   * Each range has "View Details" and "Uncondense" buttons
+//   * Integrated into main status panel below changed chapters section
+// - [NEW FEATURE] View condensed range details modal
+//   * showCondensedRangeDetails() opens detailed modal for any condensed range
+//   * Displays current condensed summary with metadata
+//   * Shows all archived original summaries with chapter numbers
+//   * Scrollable sections for long content
+// - [NEW FEATURE] Uncondense entire range with preview
+//   * confirmUncondenseRange() shows preview modal before uncondensing
+//   * Displays token impact calculation (+X tokens, +Y%)
+//   * uncondenseEntireRange() deletes condensed entry and restores all originals
+//   * Updates fingerprints to mark chapters as no longer condensed
+// - [NEW FEATURE] Undo last uncondense operation
+//   * undoLastUncondense() reverses an uncondense operation
+//   * Stores undo data (condensed entry backup) before uncondensing
+//   * Undo button appears in UI when undo data is available
+//   * Facilitates testing and error recovery
+// - [CRITICAL BUG FIX] Fixed aggressive condensation leaving duplicate entries
+//   * Root cause: condenseWithExpansion() expanded condensed ranges but didn't delete individual entries
+//   * Example: "Chapters 1-5" expanded + Chapters 6-9 should = "Chapters 1-9"
+//   * But Chapter 9 wasn't deleted because only condensed entries were being removed
+//   * Solution: Track ALL entry IDs (condensed + individual) and delete before condensing
+//   * Created condenseSummariesWithoutDeletion() to handle pre-deleted entries
+//   * Now properly cleans up all old entries before creating new condensed range
+// - [BUG FIX] Fixed uncondense single chapter errors and stale UI data
+//   * uncondenseSingleChapter() was calling condenseSummaries() which tried to delete non-existent entries
+//   * Changed to use condenseSummariesWithoutDeletion() since working with archived summaries
+//   * Fixed storage update: old range filtered out but never saved, causing stale UI display
+//   * Now properly saves filtered condensedRanges array before creating new ranges
+//   * UI correctly shows only the new split ranges after uncondense operation
+// - [FEATURE] Single-chapter condensation during uncondense splits for token efficiency
+//   * When uncondensing creates a split with single chapters, they get condensed summaries
+//   * Example: Uncondensing Chapter 3 from "Chapters 2-4" creates condensed "Chapter 2" + detailed "Chapter 3" + condensed "Chapter 4"
+//   * Rationale: User wants detailed version of ONE chapter, others should remain token-efficient
+//   * Prevents token bloat when user is already exceeding budget during uncondense operations
+//   * Single-chapter condensed entries use "Chapter N" format (not "Chapters N-N")
+//   * Updated regex in backup viewer to accept both "Chapter N" and "Chapters N" formats
+//   * Added safeguards to AUTOMATIC condensation functions (normal, aggressive, emergency)
+//   * Automatic condensation requires minimum 2 chapters - single chapters only from manual uncondense
 
 // CHANGELOG v1.5.0:
 // - [NEW FEATURE] Comprehensive backup browser
@@ -183,6 +227,13 @@ type ArchivedSummary = {
     archivedAt: number;
 }
 
+type UndoCondenseData = {
+    rangeId: string;
+    condensedEntry: LorebookEntry | null;
+    originalSummaries: ArchivedSummary[];
+    timestamp: number;
+}
+
 type ChapterSummaryEntry = {
     entryId: string;
     chapterNumber: number;
@@ -277,6 +328,7 @@ let autoRegenerate: boolean;
 // Track background work
 let backgroundSummaryInProgress: boolean = false;
 let batchRegenerationInProgress: boolean = false;
+let multiChapterBatchInProgress: boolean = false;  // v1.5.1: Prevents condensation during multi-chapter batch processing
 
 // Auto-detection state (v1.4.0)
 let generationCounter: number = 0;  // Track non-interactive generations (resets on user action)
@@ -867,6 +919,898 @@ async function dismissAllChangedChapters(): Promise<void> {
             }
         ]
     });
+}
+
+// ============================================================================
+// CONDENSED RANGES UI FUNCTIONS (v1.5.1)
+// ============================================================================
+
+/**
+ * v1.5.1: Build UI content for displaying condensed ranges
+ * Shows all current condensed ranges with their details and action buttons
+ * @returns Promise<UIPart[]> UI content for condensed ranges section
+ */
+async function buildCondensedRangesUI(): Promise<UIPart[]> {
+    const condensedRanges: CondensedRange[] = await api.v1.storyStorage.get("condensedRanges") || [];
+    const content: UIPart[] = [];
+    
+    // Check if undo is available
+    const undoData: UndoCondenseData | null = await api.v1.storyStorage.get("lastUndoData");
+    
+    // Header
+    const headerText = condensedRanges.length > 0 
+        ? `**📦 Condensed Ranges (${condensedRanges.length})**\n\nThese chapter groups have been condensed to save tokens.`
+        : "**📦 Condensed Ranges**\n\nNo condensed ranges currently.";
+    
+    content.push({
+        type: "text",
+        text: headerText,
+        markdown: true,
+        style: { marginBottom: "8px" }
+    });
+    
+    // Undo button if available (show even when no ranges exist)
+    if (undoData && undoData.condensedEntry) {
+        content.push({
+            type: "button",
+            text: "⏪ Undo Last Uncondense",
+            iconId: "reload",
+            callback: async () => {
+                await undoLastUncondense();
+            },
+            style: { marginBottom: "12px", fontSize: "0.9em" }
+        });
+    }
+    
+    // If no ranges, return early after showing undo button (if available)
+    if (condensedRanges.length === 0) {
+        return content;
+    }
+
+    // Sort ranges by start chapter
+    condensedRanges.sort((a, b) => a.startChapter - b.startChapter);
+
+    // Build UI for each range
+    for (let i = 0; i < condensedRanges.length; i++) {
+        const range = condensedRanges[i];
+        
+        // Separator (except before first)
+        if (i > 0) {
+            content.push({
+                type: "container",
+                style: {
+                    borderTop: "1px solid rgba(255, 255, 255, 0.2)",
+                    marginTop: "12px",
+                    marginBottom: "12px"
+                },
+                content: []
+            });
+        }
+
+        // Range info
+        const condensedDate = new Date(range.condensedAt).toLocaleString();
+        const chapterCount = range.endChapter - range.startChapter + 1;
+        const originalCount = range.originalSummaries.length;
+        
+        const rangeTitle = range.startChapter === range.endChapter ? `Chapter ${range.startChapter}` : `Chapters ${range.startChapter}-${range.endChapter}`;
+        const chapterLabel = chapterCount === 1 ? 'chapter' : 'chapters';
+        let rangeText = `**${rangeTitle}** (${chapterCount} ${chapterLabel})\n`;
+        rangeText += `📊 ${range.condensedTokens} tokens • `;
+        rangeText += `📅 Condensed ${condensedDate}\n`;
+        rangeText += `📚 ${originalCount} original ${originalCount === 1 ? 'summary' : 'summaries'} archived`;
+        
+        content.push({
+            type: "text",
+            text: rangeText,
+            markdown: true,
+            style: { marginBottom: "8px" }
+        });
+
+        // Action buttons
+        content.push({
+            type: "row",
+            spacing: "start",
+            content: [
+                {
+                    type: "button",
+                    text: "View Details",
+                    iconId: "eye",
+                    callback: async () => {
+                        await showCondensedRangeDetails(range);
+                    },
+                    style: { marginRight: "8px" }
+                },
+                {
+                    type: "button",
+                    text: "Uncondense",
+                    iconId: "folder-minus",
+                    callback: async () => {
+                        await confirmUncondenseRange(range);
+                    }
+                }
+            ],
+            style: { marginBottom: "8px" }
+        });
+    }
+
+    return content;
+}
+
+/**
+ * v1.5.1: Show details modal for a condensed range
+ * Displays the condensed summary and all original summaries
+ * @param range The condensed range to show details for
+ */
+async function showCondensedRangeDetails(range: CondensedRange): Promise<void> {
+    const modalContent: UIPart[] = [];
+    
+    // Fetch the condensed summary from the lorebook entry
+    const lorebookEntry: LorebookEntry | null = await api.v1.lorebook.entry(range.lorebookEntryId);
+    const condensedSummary: string | undefined = lorebookEntry ? lorebookEntry.text : "[Summary not found]";
+    
+    // Header section
+    const rangeTitle = range.startChapter === range.endChapter ? `Chapter ${range.startChapter}` : `Chapters ${range.startChapter}-${range.endChapter}`;
+    const chapterCount = range.endChapter - range.startChapter + 1;
+    const chapterLabel = chapterCount === 1 ? 'chapter' : 'chapters';
+    modalContent.push({
+        type: "text",
+        text: `# 📦 Condensed Range Details\n\n**${rangeTitle}** (${chapterCount} ${chapterLabel})`,
+        markdown: true,
+        style: { marginBottom: "16px" }
+    });
+    
+    // Metadata section
+    const condensedDate: string = new Date(range.condensedAt).toLocaleString();
+    modalContent.push({
+        type: "text",
+        text: `**📊 Token Count:** ${range.condensedTokens}\n**📅 Condensed:** ${condensedDate}\n**📚 Original Summaries:** ${range.originalSummaries.length}`,
+        markdown: true,
+        style: { 
+            marginBottom: "16px",
+            padding: "12px",
+            backgroundColor: "rgba(100, 150, 255, 0.1)",
+            borderRadius: "4px"
+        }
+    });
+    
+    // Condensed summary section
+    modalContent.push({
+        type: "text",
+        text: "## Current Condensed Summary",
+        markdown: true,
+        style: { marginBottom: "8px", marginTop: "16px" }
+    });
+    
+    modalContent.push({
+        type: "text",
+        text: condensedSummary,
+        markdown: false,
+        style: {
+            padding: "12px",
+            backgroundColor: "rgba(0, 0, 0, 0.3)",
+            borderRadius: "4px",
+            marginBottom: "24px",
+            fontFamily: "monospace",
+            fontSize: "0.9em",
+            whiteSpace: "pre-wrap",
+            maxHeight: "200px",
+            overflowY: "auto"
+        }
+    });
+    
+    // Original summaries section
+    modalContent.push({
+        type: "text",
+        text: "## Original Summaries (Archived)",
+        markdown: true,
+        style: { marginBottom: "12px" }
+    });
+    
+    if (range.originalSummaries.length === 0) {
+        modalContent.push({
+            type: "text",
+            text: "*No original summaries available*",
+            markdown: true,
+            style: { fontStyle: "italic", color: "rgba(255, 255, 255, 0.5)" }
+        });
+    } else {
+        // Display each original summary
+        for (let i = 0; i < range.originalSummaries.length; i++) {
+            const original: ArchivedSummary = range.originalSummaries[i];
+            
+            // Separator between summaries (except first)
+            if (i > 0) {
+                modalContent.push({
+                    type: "container",
+                    style: {
+                        borderTop: "1px solid rgba(255, 255, 255, 0.2)",
+                        marginTop: "16px",
+                        marginBottom: "16px"
+                    },
+                    content: []
+                });
+            }
+            
+            // Summary header
+            modalContent.push({
+                type: "text",
+                text: `**Chapter ${original.chapterNumber}**`,
+                markdown: true,
+                style: { marginBottom: "8px" }
+            });
+            
+            // Summary content
+            modalContent.push({
+                type: "text",
+                text: original.text,
+                markdown: false,
+                style: {
+                    padding: "10px",
+                    backgroundColor: "rgba(0, 0, 0, 0.2)",
+                    borderRadius: "4px",
+                    marginBottom: "8px",
+                    fontFamily: "monospace",
+                    fontSize: "0.85em",
+                    whiteSpace: "pre-wrap",
+                    borderLeft: "3px solid rgba(100, 150, 255, 0.5)"
+                }
+            });
+            
+            // v1.5.1 Feature 4: Uncondense single chapter button
+            modalContent.push({
+                type: "button",
+                text: "Uncondense This Chapter",
+                iconId: "file-plus",
+                callback: async () => {
+                    modal.close();
+                    await confirmUncondenseSingleChapter(range, original.chapterNumber);
+                },
+                style: { marginBottom: "8px" }
+            });
+        }
+    }
+    
+    // Open modal
+    const modalTitle = range.startChapter === range.endChapter ? `Condensed Range: Chapter ${range.startChapter}` : `Condensed Range: Chapters ${range.startChapter}-${range.endChapter}`;
+    const modal = api.v1.ui.modal.open({
+        title: modalTitle,
+        size: "large",
+        content: modalContent
+    });
+    
+    await modal.closed;
+}
+
+/**
+ * v1.5.1: Uncondense an entire range - restore all original summaries
+ * Deletes the condensed entry and recreates all original entries
+ * @param range The condensed range to uncondense
+ */
+async function uncondenseEntireRange(range: CondensedRange): Promise<void> {
+    try {
+        await api.v1.ui.updateParts([{
+            id: "condensed-ranges-box",
+            content: [{
+                type: "text",
+                text: `⏳ Uncondensing chapters ${range.startChapter}-${range.endChapter}...`,
+                markdown: true
+            }]
+        }]);
+
+        // Use the global category ID and ensure it's enabled
+        const categoryId: string = lorebookCategoryId;
+        const category = await api.v1.lorebook.category(categoryId);
+        if (category && !category.enabled) {
+            await api.v1.lorebook.updateCategory(categoryId, { enabled: true });
+            api.v1.log("✓ Enabled Chapter Summaries category");
+        }
+        
+        // Store undo data BEFORE making changes (including original summaries)
+        const undoData: UndoCondenseData = {
+            rangeId: range.id,
+            condensedEntry: await api.v1.lorebook.entry(range.lorebookEntryId),
+            originalSummaries: range.originalSummaries,
+            timestamp: Date.now()
+        };
+        await api.v1.storyStorage.set("lastUndoData", undoData);
+
+        // Delete the condensed entry
+        await api.v1.lorebook.removeEntry(range.lorebookEntryId);
+
+        // Recreate all original summaries
+        let restoredCount: number = 0;
+        for (const original of range.originalSummaries) {
+            const newEntryId: string = api.v1.uuid();
+            const displayName: string = `Chapter ${original.chapterNumber}${original.title ? `: ${original.title}` : ""}`;
+            
+            await api.v1.lorebook.createEntry({
+                id: newEntryId,
+                displayName: displayName,
+                keys: [`chapter ${original.chapterNumber}`, `chapter${original.chapterNumber}`],
+                text: original.text,
+                enabled: true,
+                category: categoryId
+            });
+            
+            restoredCount++;
+        }
+
+        // Remove from condensedRanges array
+        const condensedRanges: CondensedRange[] = await api.v1.storyStorage.get("condensedRanges") || [];
+        const updatedRanges = condensedRanges.filter(r => r.id !== range.id);
+        await api.v1.storyStorage.set("condensedRanges", updatedRanges);
+
+        // Update fingerprints - mark all restored chapters as no longer condensed
+        const fingerprints: ChapterFingerprint[] = await api.v1.storyStorage.get("chapterFingerprints") || [];
+        for (const fp of fingerprints) {
+            if (fp.chapterNumber >= range.startChapter && fp.chapterNumber <= range.endChapter) {
+                fp.isCondensed = false;
+            }
+        }
+        await api.v1.storyStorage.set("chapterFingerprints", fingerprints);
+
+        api.v1.log(`✓ Uncondensed chapters ${range.startChapter}-${range.endChapter}: restored ${restoredCount} original summaries`);
+        
+        await updateStatusPanel();
+
+    } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        api.v1.log(`✗ Failed to uncondense range: ${errorMsg}`);
+        await api.v1.ui.updateParts([{
+            id: "condensed-ranges-box",
+            content: [{
+                type: "text",
+                text: `❌ **Error uncondensing**\n\n${errorMsg}`,
+                markdown: true
+            }]
+        }]);
+    }
+}
+
+/**
+ * v1.5.1: Undo the last uncondense operation
+ * Restores the condensed entry and removes the restored individual summaries
+ */
+async function undoLastUncondense(): Promise<void> {
+    try {
+        const undoData: UndoCondenseData | null = await api.v1.storyStorage.get("lastUndoData");
+        
+        if (!undoData || !undoData.condensedEntry) {
+            api.v1.log("No undo data available");
+            return;
+        }
+
+        await api.v1.ui.updateParts([{
+            id: "condensed-ranges-box",
+            content: [{
+                type: "text",
+                text: "⏳ Undoing uncondense operation...",
+                markdown: true
+            }]
+        }]);
+
+        const entry: LorebookEntry | null = undoData.condensedEntry;
+        
+        if (!entry) {
+            throw new Error("Condensed entry data is missing from undo data");
+        }
+        
+        // Use the original summaries stored in undo data (prevents stale data issues)
+        const originalSummaries: ArchivedSummary[] = undoData.originalSummaries;
+        
+        // Extract chapter range from displayName (e.g., "Chapters 1-5 (Condensed)")
+        const rangeMatch: RegExpMatchArray | null = entry.displayName?.match(/Chapters (\d+)-(\d+)/) || null;
+        if (!rangeMatch) {
+            throw new Error("Could not parse chapter range from condensed entry");
+        }
+        
+        const startChapter: number = parseInt(rangeMatch[1]);
+        const endChapter: number = parseInt(rangeMatch[2]);
+
+        // Delete the restored individual entries (chapters in the range)
+        const categoryId: string = lorebookCategoryId;
+        const entries: LorebookEntry[] = await api.v1.lorebook.entries(categoryId);
+        
+        for (let chNum = startChapter; chNum <= endChapter; chNum++) {
+            const entryToDelete: LorebookEntry | undefined = entries.find(e => 
+                e.displayName?.startsWith(`Chapter ${chNum}:`) || 
+                e.displayName === `Chapter ${chNum}`
+            );
+            if (entryToDelete) {
+                await api.v1.lorebook.removeEntry(entryToDelete.id);
+            }
+        }
+
+        // Restore the condensed entry
+        await api.v1.lorebook.createEntry(entry);
+
+        // Restore to condensedRanges array
+        const condensedRanges: CondensedRange[] = await api.v1.storyStorage.get("condensedRanges") || [];
+        
+        // Count tokens for the restored condensed entry
+        const tokens = await api.v1.tokenizer.encode(entry.text || "", "glm-4-6");
+        
+        const restoredRange: CondensedRange = {
+            id: undoData.rangeId,
+            startChapter: startChapter,
+            endChapter: endChapter,
+            lorebookEntryId: entry.id,
+            originalSummaries: originalSummaries,
+            condensedTokens: tokens.length,
+            condensedAt: undoData.timestamp
+        };
+        
+        condensedRanges.push(restoredRange);
+        await api.v1.storyStorage.set("condensedRanges", condensedRanges);
+
+        // Update fingerprints - mark chapters as condensed again
+        const fingerprints: ChapterFingerprint[] = await api.v1.storyStorage.get("chapterFingerprints") || [];
+        for (const fp of fingerprints) {
+            if (fp.chapterNumber >= startChapter && fp.chapterNumber <= endChapter) {
+                fp.isCondensed = true;
+            }
+        }
+        await api.v1.storyStorage.set("chapterFingerprints", fingerprints);
+
+        // Clear undo data
+        await api.v1.storyStorage.set("lastUndoData", null);
+
+        api.v1.log(`✓ Undo complete: restored condensed range for chapters ${startChapter}-${endChapter}`);
+        
+        await updateStatusPanel();
+
+    } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        api.v1.log(`✗ Failed to undo: ${errorMsg}`);
+        await api.v1.ui.updateParts([{
+            id: "condensed-ranges-box",
+            content: [{
+                type: "text",
+                text: `❌ **Error undoing**\n\n${errorMsg}`,
+                markdown: true
+            }]
+        }]);
+    }
+}
+
+/**
+ * v1.5.1: Show confirmation modal before uncondensing entire range
+ * @param range The range to uncondense
+ */
+async function confirmUncondenseRange(range: CondensedRange): Promise<void> {
+    const chapterCount: number = range.endChapter - range.startChapter + 1;
+    const summaryCount: number = range.originalSummaries.length;
+    
+    // Calculate token impact
+    let originalTokensTotal: number = 0;
+    for (const original of range.originalSummaries) {
+        const tokens = await api.v1.tokenizer.encode(original.text, "glm-4-6");
+        originalTokensTotal += tokens.length;
+    }
+    
+    const tokenDifference: number = originalTokensTotal - range.condensedTokens;
+    const percentIncrease: string = ((tokenDifference / range.condensedTokens) * 100).toFixed(1);
+    
+    // Modal reference to allow closing from inside callbacks
+    const modalRef: { modal?: any } = {};
+    
+    const modalContent: UIPart[] = [
+        {
+            type: "text",
+            text: `# ⚠️ Uncondense Range\n\n**Chapters ${range.startChapter}-${range.endChapter}** (${chapterCount} chapters)`,
+            markdown: true,
+            style: { marginBottom: "16px" }
+        },
+        {
+            type: "text",
+            text: "## What will happen:\n" +
+                  `- ❌ Delete condensed summary (${range.condensedTokens} tokens)\n` +
+                  `- ✅ Restore ${summaryCount} original summaries (${originalTokensTotal} tokens)\n` +
+                  `- 📊 Net change: **+${tokenDifference} tokens** (+${percentIncrease}%)`,
+            markdown: true,
+            style: { 
+                marginBottom: "16px",
+                padding: "12px",
+                backgroundColor: "rgba(255, 165, 0, 0.1)",
+                borderRadius: "4px",
+                border: "1px solid rgba(255, 165, 0, 0.3)"
+            }
+        },
+        {
+            type: "text",
+            text: "💡 **Tip:** You can undo this operation using the 'Undo Last Uncondense' button if needed.",
+            markdown: true,
+            style: { 
+                marginBottom: "16px",
+                fontStyle: "italic",
+                fontSize: "0.9em"
+            }
+        },
+        {
+            type: "row",
+            spacing: "start",
+            content: [
+                {
+                    type: "button",
+                    text: "Uncondense Range",
+                    iconId: "check",
+                    callback: async () => {
+                        // Close modal first to unblock UI
+                        if (modalRef.modal) {
+                            modalRef.modal.close();
+                        }
+                        // Then perform the operation
+                        await uncondenseEntireRange(range);
+                    },
+                    style: { marginRight: "8px" }
+                },
+                {
+                    type: "button",
+                    text: "Cancel",
+                    iconId: "x",
+                    callback: async () => {
+                        if (modalRef.modal) {
+                            modalRef.modal.close();
+                        }
+                    }
+                }
+            ]
+        }
+    ];
+    
+    modalRef.modal = api.v1.ui.modal.open({
+        title: "Confirm Uncondense",
+        size: "medium",
+        content: modalContent
+    });
+    
+    await modalRef.modal.closed;
+}
+
+/**
+ * v1.5.1 Feature 4: Show confirmation modal for uncondensing a single chapter
+ * This will split the condensed range as needed
+ */
+async function confirmUncondenseSingleChapter(range: CondensedRange, chapterNumber: number): Promise<void> {
+    // Calculate what the result will look like
+    const rangeSize: number = range.endChapter - range.startChapter + 1;
+    
+    // Determine the resulting ranges
+    let resultDescription: string;
+    let newRanges: { start: number, end: number }[] = [];
+    
+    if (rangeSize === 1) {
+        // Edge case: Single chapter range (shouldn't happen but handle it)
+        resultDescription = `This will restore **Chapter ${chapterNumber}** as a detailed summary.`;
+    } else if (chapterNumber === range.startChapter && chapterNumber === range.endChapter) {
+        // Edge case: Only one chapter in range
+        resultDescription = `This will restore **Chapter ${chapterNumber}** as a detailed summary.`;
+    } else if (chapterNumber === range.startChapter) {
+        // Uncondensing first chapter: remaining range is startChapter+1 to endChapter
+        newRanges.push({ start: range.startChapter + 1, end: range.endChapter });
+        const remainingSize = range.endChapter - (range.startChapter + 1) + 1;
+        if (remainingSize === 1) {
+            resultDescription = `This will:\n- Restore **Chapter ${chapterNumber}** as a detailed summary\n- Condense **Chapter ${range.endChapter}** (single chapter, condensed for token efficiency)`;
+        } else {
+            resultDescription = `This will:\n- Restore **Chapter ${chapterNumber}** as a detailed summary\n- Keep **Chapters ${range.startChapter + 1}-${range.endChapter}** condensed`;
+        }
+    } else if (chapterNumber === range.endChapter) {
+        // Uncondensing last chapter: remaining range is startChapter to endChapter-1
+        newRanges.push({ start: range.startChapter, end: range.endChapter - 1 });
+        const remainingSize = (range.endChapter - 1) - range.startChapter + 1;
+        if (remainingSize === 1) {
+            resultDescription = `This will:\n- Restore **Chapter ${chapterNumber}** as a detailed summary\n- Condense **Chapter ${range.startChapter}** (single chapter, condensed for token efficiency)`;
+        } else {
+            resultDescription = `This will:\n- Restore **Chapter ${chapterNumber}** as a detailed summary\n- Keep **Chapters ${range.startChapter}-${range.endChapter - 1}** condensed`;
+        }
+    } else {
+        // Uncondensing middle chapter: split into two ranges
+        newRanges.push({ start: range.startChapter, end: chapterNumber - 1 });
+        newRanges.push({ start: chapterNumber + 1, end: range.endChapter });
+        
+        const leftSize = (chapterNumber - 1) - range.startChapter + 1;
+        const rightSize = range.endChapter - (chapterNumber + 1) + 1;
+        
+        let leftDesc: string;
+        let rightDesc: string;
+        
+        if (leftSize === 1) {
+            leftDesc = `**Chapter ${range.startChapter}** (condensed)`;
+        } else {
+            leftDesc = `**Chapters ${range.startChapter}-${chapterNumber - 1}** (condensed)`;
+        }
+        
+        if (rightSize === 1) {
+            rightDesc = `**Chapter ${range.endChapter}** (condensed)`;
+        } else {
+            rightDesc = `**Chapters ${chapterNumber + 1}-${range.endChapter}** (condensed)`;
+        }
+        
+        resultDescription = `This will:\n- Restore **Chapter ${chapterNumber}** as a detailed summary\n- Split the range into:\n  • ${leftDesc}\n  • ${rightDesc}`;
+    }
+    
+    // Calculate token impact
+    const originalChapter: ArchivedSummary | undefined = range.originalSummaries.find(s => s.chapterNumber === chapterNumber);
+    let originalTokens: number = 0;
+    if (originalChapter) {
+        const model: string = "glm-4-6";
+        const tokens: number[] = await api.v1.tokenizer.encode(originalChapter.text, model);
+        originalTokens = tokens.length;
+    }
+    
+    // Estimate new condensed tokens (rough estimate)
+    const tokensPerChapter: number = Math.floor(range.condensedTokens / rangeSize);
+    let estimatedNewTokens = originalTokens;
+    for (const newRange of newRanges) {
+        const newRangeSize: number = newRange.end - newRange.start + 1;
+        estimatedNewTokens += tokensPerChapter * newRangeSize;
+    }
+    
+    const tokenDelta: number = estimatedNewTokens - range.condensedTokens;
+    const tokenSign: string = tokenDelta > 0 ? "+" : "";
+    
+    const modalContent: UIPart[] = [
+        {
+            type: "text",
+            text: `# Uncondense Single Chapter\n\n**Current Range:** Chapters ${range.startChapter}-${range.endChapter} (${rangeSize} chapters)`,
+            markdown: true,
+            style: { marginBottom: "16px" }
+        },
+        {
+            type: "text",
+            text: resultDescription,
+            markdown: true,
+            style: {
+                padding: "12px",
+                backgroundColor: "rgba(100, 150, 255, 0.1)",
+                borderRadius: "4px",
+                marginBottom: "16px"
+            }
+        },
+        {
+            type: "text",
+            text: `**Token Impact (Estimated):**\n- Current: ${range.condensedTokens} tokens\n- After: ~${estimatedNewTokens} tokens (${tokenSign}${tokenDelta})`,
+            markdown: true,
+            style: { marginBottom: "16px" }
+        },
+        {
+            type: "text",
+            text: (() => {
+                // All resulting ranges get condensed summaries (including single chapters for token efficiency)
+                if (newRanges.length === 0) {
+                    return "ℹ️ **Note:** No condensation needed - only restoring the selected chapter.";
+                } else if (newRanges.length === 1) {
+                    return "⚠️ **Note:** This will require generating 1 new condensed summary.";
+                } else {
+                    return `⚠️ **Note:** This will require generating ${newRanges.length} new condensed summaries.`;
+                }
+            })(),
+            markdown: true,
+            style: { marginBottom: "16px", fontStyle: "italic" }
+        },
+        {
+            type: "row",
+            spacing: "start",
+            content: [
+                {
+                    type: "button",
+                    text: "Uncondense Chapter",
+                    iconId: "check",
+                    callback: async () => {
+                        modal.close();
+                        await uncondenseSingleChapter(range, chapterNumber, newRanges);
+                    },
+                    style: { marginRight: "8px" }
+                },
+                {
+                    type: "button",
+                    text: "Cancel",
+                    iconId: "x",
+                    callback: () => {
+                        modal.close();
+                    }
+                }
+            ]
+        }
+    ];
+    
+    const modal = api.v1.ui.modal.open({
+        title: "Confirm Uncondense Single Chapter",
+        size: "medium",
+        content: modalContent
+    });
+    
+    await modal.closed;
+}
+
+/**
+ * v1.5.1 Feature 4: Uncondense a single chapter from a condensed range
+ * This will split the range as needed and generate new condensed summaries
+ */
+async function uncondenseSingleChapter(
+    range: CondensedRange,
+    chapterNumber: number,
+    newRanges: { start: number, end: number }[]
+): Promise<void> {
+    try {
+        api.v1.log(`Uncondensing chapter ${chapterNumber} from range ${range.startChapter}-${range.endChapter}`);
+        
+        // v1.5.1: Check generation limit before starting
+        // Each new range will require one generation, so check if we have capacity
+        const generationsNeeded = newRanges.length;
+        if (generationCounter + generationsNeeded > 5) {
+            api.v1.ui.larry.help({
+                question: `⚠️ Generation limit warning: This operation requires ${generationsNeeded} generation(s), but you're at ${generationCounter}/5.\n\nContinue anyway? The editor may become temporarily unresponsive.`,
+                options: [
+                    {
+                        text: "Continue",
+                        callback: async () => {
+                            // Proceed with uncondense
+                            await performUncondenseSingleChapter(range, chapterNumber, newRanges);
+                        }
+                    },
+                    {
+                        text: "Cancel",
+                        callback: () => {
+                            api.v1.log("Uncondense cancelled due to generation limit");
+                        }
+                    }
+                ]
+            });
+            return;
+        }
+        
+        await performUncondenseSingleChapter(range, chapterNumber, newRanges);
+        
+    } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        api.v1.error(`Error uncondensing chapter ${chapterNumber}:`, errorMsg);
+        
+        api.v1.ui.larry.help({
+            question: `Failed to uncondense Chapter ${chapterNumber}: ${errorMsg}`,
+            options: [{ text: "OK", callback: () => {} }]
+        });
+    }
+}
+
+/**
+ * v1.5.1: Internal function to perform the actual uncondense operation
+ * Separated from uncondenseSingleChapter() to handle generation limit checking
+ */
+async function performUncondenseSingleChapter(
+    range: CondensedRange,
+    chapterNumber: number,
+    newRanges: { start: number, end: number }[]
+): Promise<void> {
+    try {
+        // Ensure the category is enabled
+        const category: LorebookCategory | null = await api.v1.lorebook.category(lorebookCategoryId);
+        if (category && !category.enabled) {
+            await api.v1.lorebook.updateCategory(lorebookCategoryId, { enabled: true });
+            if (DEBUG_MODE) {
+                api.v1.log("Enabled lorebook category");
+            }
+        }
+        
+        // Delete the old condensed entry
+        await api.v1.lorebook.removeEntry(range.lorebookEntryId);
+        if (DEBUG_MODE) {
+            api.v1.log(`Deleted old condensed entry: ${range.lorebookEntryId}`);
+        }
+        
+        // Restore the chapter as a detailed entry
+        const originalSummary: ArchivedSummary | undefined = range.originalSummaries.find(s => s.chapterNumber === chapterNumber);
+        if (!originalSummary) {
+            throw new Error(`Original summary for chapter ${chapterNumber} not found in archived data`);
+        }
+        
+        const chapterEntry: LorebookEntry = {
+            id: api.v1.uuid(),
+            displayName: originalSummary.title || `Chapter ${chapterNumber}`,
+            category: lorebookCategoryId,
+            text: originalSummary.text,
+            keys: undefined,
+            hidden: false,
+            enabled: true,
+            advancedConditions: undefined,
+            forceActivation: true
+        };
+        
+        await api.v1.lorebook.createEntry(chapterEntry);
+        api.v1.log(`✓ Restored Chapter ${chapterNumber} as detailed entry`);
+        
+        // Update fingerprints
+        const fingerprints: ChapterFingerprint[] = await getChapterFingerprints();
+        const fp: ChapterFingerprint | undefined = fingerprints.find(f => f.chapterNumber === chapterNumber);
+        if (fp) {
+            fp.isCondensed = false;
+        }
+        await api.v1.storyStorage.set("chapterFingerprints", fingerprints);
+        
+        // Remove the old condensed range from storage
+        let condensedRanges: CondensedRange[] = await api.v1.storyStorage.get("condensedRanges") || [];
+        condensedRanges = condensedRanges.filter(r => r.id !== range.id);
+        await api.v1.storyStorage.set("condensedRanges", condensedRanges);
+        
+        if (DEBUG_MODE) {
+            api.v1.log(`Removed old range ${range.startChapter}-${range.endChapter} from storage`);
+        }
+        
+        // Create new condensed ranges for the split
+        if (newRanges.length > 0) {
+            api.v1.log(`Creating ${newRanges.length} new range(s)...`);
+            
+            for (const newRange of newRanges) {
+                // Get the original summaries for this new range
+                const summariesForRange: ArchivedSummary[] = range.originalSummaries.filter(s => 
+                    s.chapterNumber >= newRange.start && s.chapterNumber <= newRange.end
+                );
+                
+                if (summariesForRange.length === 0) {
+                    api.v1.log(`⚠️ No summaries found for range ${newRange.start}-${newRange.end}, skipping`);
+                    continue;
+                }
+                
+                // v1.5.1 FIX: Even single-chapter "ranges" get condensed summaries to save tokens
+                // When user uncondenses Chapter 3 from "Chapters 2-4", they want detailed Chapter 3
+                // But Chapters 2 and 4 should remain condensed (shorter) rather than being restored to full detail
+                // This prevents unnecessary token bloat when user is already exceeding budget
+                
+                // Convert to ChapterSummaryEntry format for condenseSummaries
+                const entries: ChapterSummaryEntry[] = summariesForRange.map(s => ({
+                    entryId: "", // Not needed
+                    chapterNumber: s.chapterNumber,
+                    startChapter: s.chapterNumber,
+                    endChapter: s.chapterNumber,
+                    title: s.title,
+                    text: s.text,
+                    isCondensed: false,
+                    tokenCount: 0
+                }));
+                
+                // v1.5.1: Use singular "Chapter" for single-chapter condensed entries
+                const condensedTitle: string = newRange.start === newRange.end 
+                    ? `Chapter ${newRange.start}` 
+                    : `Chapters ${newRange.start}-${newRange.end}`;
+                api.v1.log(`Generating condensed summary for ${condensedTitle}...`);
+                
+                // v1.5.1: Increment generation counter (condenseSummariesWithoutDeletion will also increment, 
+                // but we track it here for visibility in logs)
+                if (DEBUG_MODE) {
+                    api.v1.log(`Generation counter before: ${generationCounter}/5`);
+                }
+                
+                // Generate the new condensed summary (entries don't exist in lorebook, so use version without deletion)
+                await condenseSummariesWithoutDeletion(entries, condensedTitle);
+                
+                if (DEBUG_MODE) {
+                    api.v1.log(`Generation counter after: ${generationCounter}/5`);
+                }
+                
+                api.v1.log(`✓ Created new condensed range: ${condensedTitle}`);
+            }
+        }
+        
+        // Note: Don't save condensedRanges here - condenseSummaries() already added the new ranges to storage
+        // Saving the old array would overwrite the new ranges that were just created
+        
+        // Update UI
+        await updateStatusPanel();
+        
+        api.v1.ui.larry.help({
+            question: `✓ Successfully uncondensed Chapter ${chapterNumber}. ${newRanges.length > 0 ? `Created ${newRanges.length} new condensed range(s).` : ""}`,
+            options: [{ text: "OK", callback: () => {} }]
+        });
+        
+    } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        api.v1.error(`Error uncondensing chapter ${chapterNumber}:`, errorMsg);
+        
+        api.v1.ui.larry.help({
+            question: `Failed to uncondense Chapter ${chapterNumber}: ${errorMsg}`,
+            options: [{ text: "OK", callback: () => {} }]
+        });
+    }
 }
 
 // ===========================================================================
@@ -1472,7 +2416,7 @@ async function viewBackupDetails(backup: RebuildBackup): Promise<void> {
             parsedEntries.push({ chapterNum: startChapter, entry });
         } else {
             // Fallback: try to extract from displayName
-            const nameMatch = entry.displayName?.match(/Chapter (\d+)/);
+            const nameMatch = entry.displayName?.match(/Chapters? (\d+)/);
             if (nameMatch) {
                 parsedEntries.push({ chapterNum: parseInt(nameMatch[1]), entry });
             } else {
@@ -3269,6 +4213,74 @@ async function showGenerationLimitModal(
 }
 
 /**
+ * v1.5.1: Show modal when generation limit reached during multi-chapter processing
+ */
+async function showMultiChapterLimitModal(
+    remainingCount: number,
+    currentChapter: number,
+    totalChapters: number
+): Promise<boolean> {
+    if (DEBUG_MODE) {
+        api.v1.log("Showing multi-chapter generation limit modal");
+    }
+
+    let modalContent = `**Generation Limit Warning**\n\n`;
+    modalContent += `We've used 4 out of 5 non-interactive generations allowed by NovelAI.\n\n`;
+    modalContent += `**Progress:** ${currentChapter - 1} of ${totalChapters} chapters processed\n`;
+    modalContent += `**Remaining Chapters:** ${remainingCount}\n\n`;
+    modalContent += `**Your Options:**\n`;
+    modalContent += `- **Continue:** Reset the counter and process the remaining chapter(s)\n`;
+    modalContent += `- **Skip for Now:** Stop processing. You can manually generate summaries from the panel.\n\n`;
+    modalContent += `_The generation counter resets automatically when you generate text in the editor._`;
+
+    return new Promise((resolve) => {
+        const modal = api.v1.ui.modal.open({
+            title: "⚠️ Generation Limit Reached",
+            size: "medium",
+            content: [
+                {
+                    type: "text",
+                    text: modalContent,
+                    markdown: true,
+                    style: { marginBottom: "16px" }
+                },
+                {
+                    type: "row",
+                    spacing: "end",
+                    content: [
+                        {
+                            type: "button",
+                            text: "Skip for Now",
+                            iconId: "x",
+                            callback: () => {
+                                if (DEBUG_MODE) {
+                                    api.v1.log("User chose to skip remaining multi-chapter processing");
+                                }
+                                modal.close();
+                                resolve(false);
+                            },
+                            style: { marginRight: "8px" }
+                        },
+                        {
+                            type: "button",
+                            text: "Continue",
+                            iconId: "refresh",
+                            callback: () => {
+                                if (DEBUG_MODE) {
+                                    api.v1.log("User chose to continue multi-chapter processing");
+                                }
+                                modal.close();
+                                resolve(true);
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+    });
+}
+
+/**
  * v1.4.0: Dismiss the current auto-detection notification
  * Called when user clicks dismiss button in UI
  */
@@ -3428,7 +4440,9 @@ async function getChapterSummaryEntries(): Promise<ChapterSummaryEntry[]> {
 
         const startChapter = parseInt(chapterMatch[1]);
         const endChapter = chapterMatch[2] ? parseInt(chapterMatch[2]) : startChapter;
-        const isCondensed = startChapter !== endChapter;
+        // v1.5.1 FIX: A condensed entry is one that starts with "Chapters" (plural)
+        // This includes "Chapters 7-7" which should be treated as condensed
+        const isCondensed = entry.text.startsWith("Chapters ");
 
         // Count tokens in the text
         const model = "glm-4-6";
@@ -3533,7 +4547,8 @@ Provide a concise narrative summary that captures the key plot points, character
     const summaryText = generatedSummary.choices[0].text.trim();
 
     // Format the lorebook entry text
-    const formattedText = `${condensedTitle}\nType: chapters\nSummary: ${summaryText}`;
+    const typeLabel = entriesToCondense[0].startChapter === entriesToCondense[entriesToCondense.length - 1].endChapter ? 'chapter' : 'chapters';
+    const formattedText = `${condensedTitle}\nType: ${typeLabel}\nSummary: ${summaryText}`;
 
     // Create new condensed lorebook entry
     const chapterLorebookEntry: LorebookEntry = {
@@ -3554,6 +4569,121 @@ Provide a concise narrative summary that captures the key plot points, character
     for (const entry of entriesToCondense) {
         await api.v1.lorebook.removeEntry(entry.entryId);
     }
+
+    // Store condensed range info
+    const condensedRanges = await api.v1.storyStorage.get("condensedRanges") || [];
+    const model = "glm-4-6";
+    const tokens = await api.v1.tokenizer.encode(formattedText, model);
+
+    condensedRanges.push({
+        id: api.v1.uuid(),
+        startChapter: entriesToCondense[0].startChapter,
+        endChapter: entriesToCondense[entriesToCondense.length - 1].endChapter,
+        lorebookEntryId: entryId,
+        originalSummaries: entriesToCondense.map(e => ({
+            chapterNumber: e.chapterNumber,
+            title: e.title,
+            text: e.text,
+            originalEntryId: e.entryId,
+            archivedAt: Date.now()
+        })),
+        condensedTokens: tokens.length,
+        condensedAt: Date.now()
+    });
+
+    await api.v1.storyStorage.set("condensedRanges", condensedRanges);
+
+
+    // v1.4.1: Mark chapters as condensed in fingerprints with enhanced tracking
+    const fingerprints: ChapterFingerprint[] = await getChapterFingerprints();
+    const startChapterNum = entriesToCondense[0].startChapter;
+    const endChapterNum = entriesToCondense[entriesToCondense.length - 1].endChapter;
+    
+    for (const entry of entriesToCondense) {
+        const fp = fingerprints.find(f => f.chapterNumber === entry.chapterNumber);
+        if (fp) {
+            fp.isCondensed = true;
+        }
+    }
+    await api.v1.storyStorage.set("chapterFingerprints", fingerprints);
+
+    if (DEBUG_MODE) {
+        api.v1.log(`✓ Marked chapters ${startChapterNum}-${endChapterNum} as condensed in fingerprints`);
+    }
+
+    api.v1.log(`✓ Created condensed entry: ${condensedTitle} (${tokens.length} tokens)`);
+    return entryId;
+}
+
+/**
+ * v1.5.1: Condense summaries without deleting entries (for use after manual deletion)
+ * This is used by condenseWithExpansion which handles deletion separately
+ */
+async function condenseSummariesWithoutDeletion(entriesToCondense: ChapterSummaryEntry[], condensedTitle: string): Promise<string> {
+    
+    // Check if we actually want a condensed title (for one chapter, use original title)
+    if(entriesToCondense[0].startChapter === entriesToCondense[entriesToCondense.length - 1].endChapter) {
+        condensedTitle = entriesToCondense[0].title
+    }
+    
+    api.v1.log(`Condensing ${entriesToCondense.length} summaries: ${condensedTitle} (entries already deleted)`);
+
+    // Archive the originals
+    await archiveSummaries(entriesToCondense);
+
+    // Build the condensation prompt
+    const summaryTexts = entriesToCondense.map(e => {
+        return `${e.title}:\n${e.text}\n`;
+    }).join("\n");
+
+    const condensationPrompt = `You are condensing multiple chapter summaries into a single coherent summary.
+
+Original Chapters: ${condensedTitle}
+
+Chapter Summaries:
+${summaryTexts}
+
+Provide a concise narrative summary that captures the key plot points, character developments, and important events across these chapters. Maximum length: 3-4 sentences.`;
+
+    const messages: Message[] = [{
+        role: "user",
+        content: condensationPrompt
+    }];
+
+    let generatedSummaryParams = await api.v1.generationParameters.get();
+    generatedSummaryParams.max_tokens = summaryMaxtokens;
+
+    // v1.4.1: Increment generation counter for condensation
+    generationCounter++;
+    if (DEBUG_MODE) {
+        api.v1.log(`Condensation generation counter: ${generationCounter}/5`);
+    }
+
+    // Generate the condensed summary
+    const generatedSummary = await retryableGenerate(messages, generatedSummaryParams, entriesToCondense[0].chapterNumber);
+    const summaryText = generatedSummary.choices[0].text.trim();
+
+    // Format the lorebook entry text
+    const typeLabel = entriesToCondense[0].startChapter === entriesToCondense[entriesToCondense.length - 1].endChapter ? 'chapter' : 'chapters';
+    let formattedText: string = `${condensedTitle}\nType: ${typeLabel}\n`;
+    formattedText +=  entriesToCondense[0].startChapter === entriesToCondense[entriesToCondense.length - 1].endChapter ? `Title: ${entriesToCondense[0].title}\nSummary: ${summaryText}` : `Summary: ${summaryText}`;
+
+    // Create new condensed lorebook entry
+    const chapterLorebookEntry: LorebookEntry = {
+        id: api.v1.uuid(),
+        displayName: condensedTitle,
+        category: lorebookCategoryId,
+        text: formattedText,
+        keys: undefined,
+        hidden: false,
+        enabled: true,
+        advancedConditions: undefined,
+        forceActivation: true
+    };
+
+    const entryId = await api.v1.lorebook.createEntry(chapterLorebookEntry);
+
+    // NOTE: Entries already deleted by caller - skip deletion
 
     // Store condensed range info
     const condensedRanges = await api.v1.storyStorage.get("condensedRanges") || [];
@@ -3626,17 +4756,27 @@ async function performNormalCondensation(): Promise<void> {
 
     // Group entries for condensation
     const groupSize = Math.min(chaptersPerCondensedGroup, uncondensedOldEntries.length);
+    
+    // v1.5.1: Never condense single chapters automatically (only during manual uncondense splits)
+    if (groupSize < 2) {
+        api.v1.log("Not enough chapters to form a condensed group (minimum 2 required)");
+        return;
+    }
+    
     const groupToCondense = uncondensedOldEntries.slice(0, groupSize);
 
     const startChapter = groupToCondense[0].chapterNumber;
     const endChapter = groupToCondense[groupToCondense.length - 1].chapterNumber;
     const condensedTitle = `Chapters ${startChapter}-${endChapter}`;
 
-    await condenseSummaries(groupToCondense, condensedTitle);
+    // v1.5.1 FIX: Use condenseWithExpansion to properly handle overlapping ranges
+    // This ensures any existing condensed ranges that overlap get properly cleaned up
+    await condenseWithExpansion(groupToCondense, condensedTitle);
 }
 
 /**
  * Level 2: Aggressive condensation (condense everything except last 2 chapters)
+ * v1.5.1: Properly handles already-condensed ranges by expanding them to originals
  */
 async function performAggressiveCondensation(): Promise<void> {
     api.v1.log("=== Performing Aggressive Condensation (Level 2) ===");
@@ -3644,21 +4784,31 @@ async function performAggressiveCondensation(): Promise<void> {
     const entries = await getChapterSummaryEntries();
     const totalChapters = entries.length;
 
-    if (totalChapters <= 2) {
-        api.v1.log("Not enough chapters for aggressive condensation");
+    // v1.5.1: Need at least 4 chapters (condense 2, keep 2 recent)
+    if (totalChapters <= 3) {
+        api.v1.log("Not enough chapters for aggressive condensation (need at least 4 to condense 2+)");
         return;
     }
 
     const chaptersToCondense = entries.slice(0, totalChapters - 2);
+    
+    // Additional safety: ensure we're condensing at least 2 chapters
+    if (chaptersToCondense.length < 2) {
+        api.v1.log("Not enough chapters to condense (minimum 2 required)");
+        return;
+    }
+    
     const startChapter = chaptersToCondense[0].startChapter;
     const endChapter = chaptersToCondense[chaptersToCondense.length - 1].endChapter;
     const condensedTitle = `Chapters ${startChapter}-${endChapter}`;
 
-    await condenseSummaries(chaptersToCondense, condensedTitle);
+    // v1.5.1: Expand any already-condensed entries back to their originals
+    await condenseWithExpansion(chaptersToCondense, condensedTitle);
 }
 
 /**
  * Level 3: Emergency condensation (condense everything except last chapter)
+ * v1.5.1: Properly handles already-condensed ranges by expanding them to originals
  */
 async function performEmergencyCondensation(): Promise<void> {
     api.v1.log("=== Performing Emergency Condensation (Level 3) ===");
@@ -3666,17 +4816,128 @@ async function performEmergencyCondensation(): Promise<void> {
     const entries = await getChapterSummaryEntries();
     const totalChapters = entries.length;
 
-    if (totalChapters <= 1) {
-        api.v1.log("Cannot condense - only one chapter remains");
+    // v1.5.1: Need at least 3 chapters (condense 2, keep 1 recent)
+    if (totalChapters <= 2) {
+        api.v1.log("Cannot condense - need at least 3 chapters (minimum 2 to condense)");
         return;
     }
 
     const chaptersToCondense = entries.slice(0, totalChapters - 1);
+    
+    // Additional safety: ensure we're condensing at least 2 chapters
+    if (chaptersToCondense.length < 2) {
+        api.v1.log("Not enough chapters to condense (minimum 2 required)");
+        return;
+    }
+    
     const startChapter = chaptersToCondense[0].startChapter;
     const endChapter = chaptersToCondense[chaptersToCondense.length - 1].endChapter;
     const condensedTitle = `Chapters ${startChapter}-${endChapter}`;
 
-    await condenseSummaries(chaptersToCondense, condensedTitle);
+    // v1.5.1: Expand any already-condensed entries back to their originals
+    await condenseWithExpansion(chaptersToCondense, condensedTitle);
+}
+
+/**
+ * v1.5.1: Helper function to condense entries while expanding already-condensed ranges
+ * This prevents re-condensing already-condensed text and handles overlapping ranges
+ */
+async function condenseWithExpansion(entriesToCondense: ChapterSummaryEntry[], condensedTitle: string): Promise<void> {
+    let condensedRanges: CondensedRange[] = await api.v1.storyStorage.get("condensedRanges") || [];
+    
+    // Step 1: Calculate the boundaries of the new range
+    const allChapters = entriesToCondense.map(e => e.chapterNumber);
+    const newRangeStart = Math.min(...allChapters);
+    const newRangeEnd = Math.max(...allChapters);
+    
+    if (DEBUG_MODE) {
+        api.v1.log(`New condensed range will be: Chapters ${newRangeStart}-${newRangeEnd}`);
+    }
+    
+    // Step 2: Find ALL condensed ranges that overlap with the new range
+    const overlappingRanges = condensedRanges.filter(r => {
+        const overlaps = !(r.endChapter < newRangeStart || r.startChapter > newRangeEnd);
+        if (overlaps && DEBUG_MODE) {
+            api.v1.log(`Found overlapping range: Chapters ${r.startChapter}-${r.endChapter} (will be removed)`);
+        }
+        return overlaps;
+    });
+    
+    // Step 3: Delete lorebook entries for all overlapping ranges
+    for (const range of overlappingRanges) {
+        if (DEBUG_MODE) {
+            api.v1.log(`Deleting overlapping condensed entry: ${range.lorebookEntryId}`);
+        }
+        try {
+            await api.v1.lorebook.removeEntry(range.lorebookEntryId);
+        } catch (error) {
+            if (DEBUG_MODE) {
+                api.v1.log(`Warning: Could not delete entry ${range.lorebookEntryId} (may already be deleted)`);
+            }
+        }
+    }
+    
+    // Step 4: Collect all summaries that need to be re-condensed
+    const summariesToCondense: ChapterSummaryEntry[] = [];
+    const chaptersAdded = new Set<number>(); // Track which chapters we've already added
+    
+    // Add original summaries from overlapping ranges
+    for (const range of overlappingRanges) {
+        for (const orig of range.originalSummaries) {
+            if (!chaptersAdded.has(orig.chapterNumber)) {
+                summariesToCondense.push({
+                    entryId: "",
+                    chapterNumber: orig.chapterNumber,
+                    startChapter: orig.chapterNumber,
+                    endChapter: orig.chapterNumber,
+                    title: orig.title,
+                    text: orig.text,
+                    isCondensed: false,
+                    tokenCount: 0
+                });
+                chaptersAdded.add(orig.chapterNumber);
+            }
+        }
+    }
+    
+    // Add individual (non-condensed) entries from entriesToCondense
+    for (const entry of entriesToCondense) {
+        if (!entry.isCondensed && !chaptersAdded.has(entry.chapterNumber)) {
+            // Delete the individual entry
+            if (DEBUG_MODE) {
+                api.v1.log(`Deleting individual entry: Chapter ${entry.chapterNumber}`);
+            }
+            try {
+                await api.v1.lorebook.removeEntry(entry.entryId);
+            } catch (error) {
+                if (DEBUG_MODE) {
+                    api.v1.log(`Warning: Could not delete entry ${entry.entryId}`);
+                }
+            }
+            
+            // Add to summaries list
+            summariesToCondense.push(entry);
+            chaptersAdded.add(entry.chapterNumber);
+        }
+    }
+    
+    // Sort by chapter number
+    summariesToCondense.sort((a, b) => a.chapterNumber - b.chapterNumber);
+    
+    // Step 5: Remove all overlapping ranges from storage
+    condensedRanges = condensedRanges.filter(r => {
+        const overlaps = !(r.endChapter < newRangeStart || r.startChapter > newRangeEnd);
+        return !overlaps;
+    });
+    await api.v1.storyStorage.set("condensedRanges", condensedRanges);
+    
+    if (DEBUG_MODE) {
+        api.v1.log(`Collected ${summariesToCondense.length} summaries for re-condensation`);
+        api.v1.log(`Removed ${overlappingRanges.length} overlapping ranges from storage`);
+    }
+    
+    // Step 6: Create new condensed summary
+    await condenseSummariesWithoutDeletion(summariesToCondense, condensedTitle);
 }
 
 /**
@@ -3935,8 +5196,21 @@ async function updateStatusPanel(): Promise<void> {
 
     // Get summary breakdown
     const entries = await getChapterSummaryEntries();
-    const detailedEntries = entries.filter(e => !e.isCondensed);
-    const condensedEntries = entries.filter(e => e.isCondensed);
+    const condensedRanges = await api.v1.storyStorage.get("condensedRanges") || [];
+    
+    // v1.5.1: Count condensed ranges properly
+    const condensedEntries = condensedRanges;
+    
+    // Get chapters covered by condensed ranges
+    const condensedChapters = new Set<number>();
+    for (const range of condensedRanges) {
+        for (let ch = range.startChapter; ch <= range.endChapter; ch++) {
+            condensedChapters.add(ch);
+        }
+    }
+    
+    // Detailed entries are those not in any condensed range
+    const detailedEntries = entries.filter(e => !e.isCondensed && !condensedChapters.has(e.chapterNumber));
 
     let statusText = `**Token Usage:**\n`;
     statusText += `${tokenStatus} ${currentTokens} / ${currentMaxTokens} tokens (${percentUsed}%)\n`;
@@ -3996,6 +5270,9 @@ async function updateStatusPanel(): Promise<void> {
 
     // Build dynamic changed chapters UI
     const changedChaptersContent = await buildChangedChaptersUI();
+    
+    // v1.5.1: Build condensed ranges UI
+    const condensedRangesContent = await buildCondensedRangesUI();
 
     try {
         // Update status display
@@ -4008,6 +5285,12 @@ async function updateStatusPanel(): Promise<void> {
         await api.v1.ui.updateParts([{
             id: "changed-chapters-box",
             content: changedChaptersContent
+        }]);
+        
+        // v1.5.1: Update condensed ranges box
+        await api.v1.ui.updateParts([{
+            id: "condensed-ranges-box",
+            content: condensedRangesContent
         }]);
 
         // v1.4.1: Clear temporary status messages to prevent stale UI
@@ -4408,17 +5691,10 @@ async function scanForPreviousChapter(sections: DocumentSections): Promise<{ tex
  * MODIFIED in v1.2.0: Added checkAndCondenseIfNeeded() call at the end
  */
 async function generateChapterSummary(chapterData: { text: string; title: string | null }) {
-    const pendingChapter = await api.v1.storyStorage.get("pendingChapter") || 1;
+    let pendingChapter = await api.v1.storyStorage.get("pendingChapter") || 1;
 
     try {
         api.v1.log(`=== Starting summary generation for chapter ${pendingChapter} ===`);
-
-        if (isFirstChapter) {
-            isFirstChapter = false;
-            await api.v1.storyStorage.set("isFirstChapter", false);
-            if (DEBUG_MODE)
-                api.v1.log("Generated first chapter entry, setting isFirstChapter false");
-        }
 
         // Use the extracted title or generate a default
         let chapterTitle = chapterData.title || `Chapter ${pendingChapter}`;
@@ -4442,6 +5718,12 @@ async function generateChapterSummary(chapterData: { text: string; title: string
         // Attempt generation with retries
         const generatedSummary = await retryableGenerate(message, generatedSummaryParams, pendingChapter);
         const summaryText = generatedSummary.choices[0].text.trim();
+        
+        // Increment generation counter after successful generation
+        generationCounter++;
+        if (DEBUG_MODE) {
+            api.v1.log(`Generation counter: ${generationCounter}/5`);
+        }
 
         // Format the lorebook entry text
         const formattedText = `Chapter ${pendingChapter}\nType: chapter\nTitle: ${chapterTitle}\nSummary: ${summaryText}`;
@@ -4488,8 +5770,13 @@ async function generateChapterSummary(chapterData: { text: string; title: string
         await updateStatusPanel();
 
         // Check if we need to condense summaries
-        api.v1.log("Checking if condensation is needed...");
-        await checkAndCondenseIfNeeded();
+        // Skip during multi-chapter batch processing to prevent fragmented condensation
+        if (!multiChapterBatchInProgress) {
+            api.v1.log("Checking if condensation is needed...");
+            await checkAndCondenseIfNeeded();
+        } else if (DEBUG_MODE) {
+            api.v1.log("Skipping condensation check (multi-chapter batch in progress)");
+        }
 
     } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
@@ -4583,15 +5870,83 @@ const onResponseHook: OnResponse = async (params) => {
                     }
 
                     const freshSections = await api.v1.document.scan();
-                    const previousChapter = await scanForPreviousChapter(freshSections);
-                    await generateChapterSummary(previousChapter);
+                    const fullText = freshSections.map(s => s.section.text).join('\n');
+                    
+                    // BUG FIX v1.5.1: If isFirstChapter is true, process ALL existing chapters
+                    if (isFirstChapter) {
+                        // Set isFirstChapter=false NOW before the loop starts
+                        // This prevents each generateChapterSummary call from resetting pendingChapter to 1
+                        isFirstChapter = false;
+                        await api.v1.storyStorage.set("isFirstChapter", false);
+                        if (DEBUG_MODE) {
+                            api.v1.log("Set isFirstChapter=false before multi-chapter processing");
+                        }
+                        
+                        // Set batch processing flag to prevent condensation during the loop
+                        multiChapterBatchInProgress = true;
+                        if (DEBUG_MODE) {
+                            api.v1.log("Set multiChapterBatchInProgress=true to prevent fragmented condensation");
+                        }
+                        
+                        const chapters = splitIntoChapters(fullText);
+                        api.v1.log(`Processing ${chapters.length} existing chapters`);
+                        
+                        for (let i = 0; i < chapters.length; i++) {
+                            // Check generation limit BEFORE attempting generation
+                            if (generationCounter >= 4) {
+                                // Show modal asking if user wants to continue
+                                if (DEBUG_MODE) {
+                                    api.v1.log(`Generation counter at ${generationCounter} - showing limit modal`);
+                                }
+                                
+                                const remainingCount = chapters.length - i;
+                                const shouldContinue = await showMultiChapterLimitModal(remainingCount, i + 1, chapters.length);
+                                
+                                if (!shouldContinue) {
+                                    // User chose "Skip for Now" - stop processing
+                                    if (DEBUG_MODE) {
+                                        api.v1.log(`User chose to skip remaining chapters. Processed ${i} of ${chapters.length}.`);
+                                    }
+                                    break;
+                                }
+                                
+                                // User chose continue - reset counter
+                                if (DEBUG_MODE) {
+                                    api.v1.log(`User chose to continue. Resetting counter and processing remaining ${remainingCount} chapters.`);
+                                }
+                                generationCounter = 0;
+                            }
+                            
+                            const chapterText = chapters[i];
+                            if (!chapterText || chapterText.trim().length === 0) continue;
+                            
+                            const chapterNumber = i + 1;
+                            const title = extractChapterTitle(chapterText);
+                            
+                            // Set pendingChapter so generateChapterSummary uses the correct number
+                            await api.v1.storyStorage.set("pendingChapter", chapterNumber);
+                            await generateChapterSummary({ text: chapterText, title });
+                            await api.v1.timers.sleep(500);
+                        }
+                        
+                        // Clear batch flag and condense once at the end
+                        multiChapterBatchInProgress = false;
+                        if (DEBUG_MODE) {
+                            api.v1.log("Multi-chapter batch complete. Checking condensation once...");
+                        }
+                        await checkAndCondenseIfNeeded();
+                    } else {
+                        const previousChapter = await scanForPreviousChapter(freshSections);
+                        await generateChapterSummary(previousChapter);
+                    }
 
                 } catch (error) {
                     const errorMsg = error instanceof Error ? error.message : String(error);
                     api.v1.error("Error in scheduled summary generation:", errorMsg);
                 } finally {
-                    // NEW in v1.2.1: Always clear flag when done
+                    // NEW in v1.2.1: Always clear flags when done
                     backgroundSummaryInProgress = false;
+                    multiChapterBatchInProgress = false;  // v1.5.1: Ensure batch flag is cleared on error
                     await updateStatusPanel();
                 }
             }, 1000); // 1 second delay - editor should unblock immediately after hook completes
@@ -4782,6 +6137,25 @@ const onContextBuiltHook: OnContextBuilt = async (params) => {
                     border: "1px solid rgba(255, 165, 0, 0.3)"
                 }
             },
+            // v1.5.1: Condensed ranges status box (dynamic content)
+            {
+                type: "box",
+                id: "condensed-ranges-box",
+                content: [
+                    {
+                        type: "text",
+                        text: "Loading...",
+                        markdown: true
+                    }
+                ],
+                style: {
+                    padding: "12px",
+                    backgroundColor: "rgba(0, 32, 64, 0.3)",
+                    borderRadius: "4px",
+                    marginBottom: "12px",
+                    border: "1px solid rgba(100, 150, 255, 0.3)"
+                }
+            },
             // Changed chapters action buttons
             {
                 type: "row",
@@ -4967,6 +6341,115 @@ const onContextBuiltHook: OnContextBuilt = async (params) => {
                                         await api.v1.ui.updateParts([{
                                             id: "test-status",
                                             text: `✗ Refresh failed: ${errorMsg}`
+                                        }]);
+                                    }
+                                },
+                                style: { marginRight: "8px" }
+                            }
+                        ]
+                    },
+                    {
+                        type: "text",
+                        text: "**Condensed Range Functions:**",
+                        markdown: true,
+                        style: { marginBottom: "4px", marginTop: "12px", fontSize: "0.9em" }
+                    },
+                    {
+                        type: "row",
+                        spacing: "start",
+                        content: [
+                            {
+                                type: "button",
+                                text: "Regenerate Condensed Summary",
+                                iconId: "refresh",
+                                callback: async () => {
+                                    try {
+                                        const condensedRanges: CondensedRange[] = await api.v1.storyStorage.get("condensedRanges") || [];
+                                        
+                                        if (condensedRanges.length === 0) {
+                                            await api.v1.ui.updateParts([{
+                                                id: "test-status",
+                                                text: "❌ No condensed ranges found."
+                                            }]);
+                                            return;
+                                        }
+                                        
+                                        await api.v1.ui.updateParts([{
+                                            id: "test-status",
+                                            text: `Found ${condensedRanges.length} condensed range(s). Regenerating summaries...`
+                                        }]);
+                                        
+                                        let regeneratedCount = 0;
+                                        for (const range of condensedRanges) {
+                                            // Check if the lorebook entry exists by ID
+                                            let entry = await api.v1.lorebook.entry(range.lorebookEntryId);
+                                            
+                                            // If not found by ID, check by display name (may have been regenerated with new ID)
+                                            if (!entry) {
+                                                const allEntries = await api.v1.lorebook.entries(lorebookCategoryId);
+                                                const expectedName = `Chapters ${range.startChapter}-${range.endChapter}`;
+                                                entry = allEntries.find(e => e.displayName === expectedName) || null;
+                                                
+                                                if (entry) {
+                                                    // Found by name but with different ID - update storage with correct ID
+                                                    api.v1.log(`Found entry "${expectedName}" with different ID, updating storage`);
+                                                    let ranges: CondensedRange[] = await api.v1.storyStorage.get("condensedRanges") || [];
+                                                    const rangeToUpdate = ranges.find(r => r.id === range.id);
+                                                    if (rangeToUpdate) {
+                                                        rangeToUpdate.lorebookEntryId = entry.id;
+                                                        await api.v1.storyStorage.set("condensedRanges", ranges);
+                                                    }
+                                                }
+                                            }
+                                            
+                                            // Only regenerate if truly missing
+                                            if (!entry) {
+                                                api.v1.log(`Regenerating missing summary for Chapters ${range.startChapter}-${range.endChapter}`);
+                                                
+                                                // Convert originalSummaries to ChapterSummaryEntry format
+                                                const entries: ChapterSummaryEntry[] = range.originalSummaries.map(s => ({
+                                                    entryId: "",
+                                                    chapterNumber: s.chapterNumber,
+                                                    startChapter: s.chapterNumber,
+                                                    endChapter: s.chapterNumber,
+                                                    title: s.title,
+                                                    text: s.text,
+                                                    isCondensed: false,
+                                                    tokenCount: 0
+                                                }));
+                                                
+                                                const condensedTitle = `Chapters ${range.startChapter}-${range.endChapter}`;
+                                                
+                                                // Delete the old entry from storage (since it doesn't exist in lorebook)
+                                                let ranges: CondensedRange[] = await api.v1.storyStorage.get("condensedRanges") || [];
+                                                ranges = ranges.filter(r => r.id !== range.id);
+                                                await api.v1.storyStorage.set("condensedRanges", ranges);
+                                                
+                                                // Regenerate the condensed summary
+                                                await condenseSummaries(entries, condensedTitle);
+                                                regeneratedCount++;
+                                            }
+                                        }
+                                        
+                                        if (regeneratedCount === 0) {
+                                            await api.v1.ui.updateParts([{
+                                                id: "test-status",
+                                                text: "✓ All condensed summaries exist - no regeneration needed."
+                                            }]);
+                                        } else {
+                                            await api.v1.ui.updateParts([{
+                                                id: "test-status",
+                                                text: `✓ Regenerated ${regeneratedCount} condensed ${regeneratedCount === 1 ? 'summary' : 'summaries'}.`
+                                            }]);
+                                        }
+                                        
+                                        await updateStatusPanel();
+                                        
+                                    } catch (error) {
+                                        const errorMsg = error instanceof Error ? error.message : String(error);
+                                        await api.v1.ui.updateParts([{
+                                            id: "test-status",
+                                            text: `✗ Regeneration failed: ${errorMsg}`
                                         }]);
                                     }
                                 },
