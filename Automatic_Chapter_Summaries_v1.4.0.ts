@@ -1,7 +1,72 @@
-// Chapter Summarize v1.3.2: Added retroactive chapter update detection and regeneration (Phase 1)
+// Chapter Summarize v1.4.1: Bug fixes and safety enhancements
 // At scene breaks, or new chapters this script will use GLM to summarize the content of the previous chapter,
 // add it as Lorebook entry and set it to always on.
-// Includes automatic token management, condensation, and change detection for retroactive edits.
+// Includes automatic token management, condensation, automatic change detection, and auto-regeneration.
+
+// CHANGELOG v1.4.1:
+// - [BUG FIX] Full rebuild now respects 5-generation limit
+//   * Added generation counter tracking to performFullRebuild()
+//   * Counter increments for each regenerate/generate action
+//   * Counter resets before and after rebuild completes
+// - [BUG FIX] Retry failed chapters now respects 5-generation limit
+//   * Added generation counter tracking to retryFailedChapters()
+//   * Counter resets before retry operations and after completion
+// - [BUG FIX] Stale UI status messages now auto-clear
+//   * updateStatusPanel() clears retry-status and rebuild-progress when no active operations
+//   * Prevents persistent "Retry complete" and similar messages
+// - [BUG FIX] Token budget warning after manual generation
+//   * New checkTokenBudgetAfterGeneration() function in onResponse hook
+//   * Shows warning modal when approaching threshold
+//   * Forces condensation when over hard limit
+//   * State-tracked condensationWarningShown flag prevents modal spam
+// - [BUG FIX] Editing condensed chapters now triggers proper regeneration
+//   * Fixed expandCondensedRange() fingerprint preservation
+//   * Changed chapters: Only mark isCondensed=false, preserve old hash
+//   * Unchanged chapters: Update fingerprint with current text
+//   * Allows proper detection and regeneration of edited condensed chapters
+// - [CRITICAL BUG FIX] Regex pattern now supports plural "Chapters"
+//   * Changed from /^Chapter (\d+)/ to /^Chapters? (\d+)/
+//   * Affects getChapterSummaryEntries(), regenerateChapter(), findEntryByChapterNumber()
+//   * Was causing: Wrong token counts, missing fingerprints, broken change detection
+//   * System was silently failing to detect condensed entries ("Chapters 1-3")
+// - [BUG FIX] Generation counter now tracks expansion operations
+//   * expandCondensedRange() increments counter for each chapter regenerated
+//   * Prevents hitting generation limit without modal during expansion
+// - [BUG FIX] Generation counter now tracks condensation operations
+//   * condenseSummaries() increments counter for condensation generation
+//   * Ensures proper tracking across all generation operation types
+// - [IMPROVEMENT] Enhanced debug logging for condensed chapters
+//   * Logs condensed chapter count during detection
+//   * Shows stored vs current hash comparisons
+//   * Helps diagnose fingerprint and detection issues
+// - [IMPROVEMENT] New "Refresh All Fingerprints" debug utility
+//   * Rescans document and updates all fingerprints to current state
+//   * Preserves isCondensed flag during update
+//   * Allows recovery from bad fingerprint state
+//   * Located in Testing & Debug section (DEBUG_MODE only)
+
+// CHANGELOG v1.4.0:
+// - [NEW FEATURE] Automatic change detection after each generation
+//   * New config option: autoDetectOnGeneration (default: false)
+//   * Hooks into onResponse to detect edited chapters after user generates text
+//   * Respects NovelAI's 5-generation non-interactive limit
+// - [NEW FEATURE] Automatic regeneration of changed chapters
+//   * New config option: autoRegenerate (default: false)
+//   * When enabled, automatically regenerates detected changed chapters
+//   * When disabled, shows notifications for manual review
+//   * Smart generation limit handling with user confirmation modal at 4/5 limit
+// - [BUG FIX] Fixed summarizeAllBreaks config to actually work
+//   * When true: All chapter breaks create summaries (previous behavior)
+//   * When false: Only breaks followed by [ on next line create summaries
+//   * Title extraction now handles incomplete brackets gracefully
+// - [IMPROVEMENT] Enhanced UI notifications for auto-detection
+//   * Shows "Auto-detected X changed chapters" with timestamp
+//   * Notifications persist until dismissed or next auto-detection
+//   * "Last auto-check" timestamp in status display
+// - [IMPROVEMENT] Generation counter tracking
+//   * Tracks non-interactive generations to respect 5-generation limit
+//   * Resets automatically when user performs text generation or UI callback
+//   * Shows warning modal at 4 generations with option to continue
 
 // CHANGELOG v1.3.2:
 // - [BUG FIX] Fixed duplicate lorebook entries after rebuild
@@ -166,6 +231,7 @@ const DEBUG_MODE: boolean = true;
 const MAX_RETRIES: number = 5;
 const RETRY_DELAYS: number[] = [1000, 2000, 3000, 4000, 5000]; // Progressive backoff
 const EDITOR_READY_TIMEOUT: number = 15000; // 15 seconds max wait
+const SCRIPT_VERSION: string = api.v1.script.version // Script version number
 
 // Configuration Schema variables
 let chapterBreakToken: string = "";
@@ -185,9 +251,22 @@ let chaptersPerCondensedGroup: number;
 // Rebuild config
 let maxRebuildBackups: number;
 
+// Auto-detection config (v1.4.0)
+let autoDetectOnGeneration: boolean;
+let autoRegenerate: boolean;
+
 // Track background work
 let backgroundSummaryInProgress: boolean = false;
 let batchRegenerationInProgress: boolean = false;
+
+// Auto-detection state (v1.4.0)
+let generationCounter: number = 0;  // Track non-interactive generations (resets on user action)
+let lastAutoCheckTimestamp: number = 0;  // Track when last auto-check happened
+let autoDetectionNotification: string = "";  // Current auto-detection notification message
+let autoRegenerationInProgress: boolean = false;  // Prevents hook loops during auto-regeneration
+
+// Condensation warning state (v1.4.1)
+let condensationWarningShown: boolean = false;  // Track if we've shown the warning modal this session
 
 // ============================================================================
 // HASHING FUNCTION
@@ -269,6 +348,37 @@ async function setChangedChapters(changed: ChangedChapter[]): Promise<void> {
 }
 
 /**
+ * v1.4.1: Check if a chapter is part of a condensed range
+ * @param chapterNumber number Chapter to check
+ * @returns Promise<CondensedRange | null> The condensed range if found, null otherwise
+ */
+async function findCondensedRangeForChapter(chapterNumber: number): Promise<CondensedRange | null> {
+    const condensedRanges: CondensedRange[] = await api.v1.storyStorage.get("condensedRanges") || [];
+    
+    for (const range of condensedRanges) {
+        if (range.startChapter <= chapterNumber && chapterNumber <= range.endChapter) {
+            if (DEBUG_MODE) {
+                api.v1.log(`Chapter ${chapterNumber} is part of condensed range: ${range.startChapter}-${range.endChapter}`);
+            }
+            return range;
+        }
+    }
+    
+    return null;
+}
+
+/**
+ * v1.4.1: Check if a chapter's fingerprint indicates it's condensed
+ * @param chapterNumber number Chapter to check
+ * @returns Promise<boolean> true if chapter is marked as condensed
+ */
+async function isChapterCondensed(chapterNumber: number): Promise<boolean> {
+    const fingerprints: ChapterFingerprint[] = await getChapterFingerprints();
+    const fp = fingerprints.find(f => f.chapterNumber === chapterNumber);
+    return fp?.isCondensed || false;
+}
+
+/**
  * Scan all chapters and detect which ones have been edited
  * @returns Promise<ChangedChapter[]> array of changed chapters
  */
@@ -299,8 +409,14 @@ async function detectChangedChapters(): Promise<ChangedChapter[]> {
         return [];
     }
 
-    // Split into chapters
-    const chapters: string[] = fullText.split(chapterBreakToken);
+    // v1.4.1: Log condensed chapter info
+    const condensedCount = fingerprints.filter(fp => fp.isCondensed).length;
+    if (DEBUG_MODE && condensedCount > 0) {
+        api.v1.log(`Found ${condensedCount} condensed chapter fingerprints`);
+    }
+
+    // Split into chapters (respects summarizeAllBreaks config)
+    const chapters: string[] = splitIntoChapters(fullText);
     const changed: ChangedChapter[] = [];
 
     // Check each stored fingerprint against current chapter text
@@ -324,6 +440,14 @@ async function detectChangedChapters(): Promise<ChangedChapter[]> {
 
         // Hash current chapter text
         const currentHash: string = hashString(chapterText);
+
+        // v1.4.1: Enhanced debug logging for condensed chapters
+        if (DEBUG_MODE && fp.isCondensed) {
+            api.v1.log(`Checking condensed chapter ${fp.chapterNumber}:`);
+            api.v1.log(`  Stored hash: ${fp.textHash}`);
+            api.v1.log(`  Current hash: ${currentHash}`);
+            api.v1.log(`  Match: ${currentHash === fp.textHash}`);
+        }
 
         // Compare hashes
         if (currentHash !== fp.textHash) {
@@ -360,7 +484,136 @@ async function detectChangedChapters(): Promise<ChangedChapter[]> {
 }
 
 /**
+ * v1.4.1: Expand a condensed range back into individual chapter summaries
+ * Used when a chapter in a condensed range is edited and needs regeneration
+ * 
+ * @param range CondensedRange The condensed range to expand
+ * @returns Promise<void>
+ */
+async function expandCondensedRange(range: CondensedRange): Promise<void> {
+    if (DEBUG_MODE) {
+        api.v1.log(`=== Expanding Condensed Range: Chapters ${range.startChapter}-${range.endChapter} ===`);
+    }
+
+    // Get changed chapters to know which ones need regeneration vs just expansion
+    const changedChapters: ChangedChapter[] = await getChangedChapters();
+    const changedChapterNumbers = new Set(changedChapters.map(c => c.chapterNumber));
+
+    // Get current document text
+    const sections: DocumentSections = await api.v1.document.scan();
+    const fullText = sections.map(s => s.section.text).join('\n');
+    const chapters: string[] = splitIntoChapters(fullText);
+
+    // Delete the condensed lorebook entry
+    if (DEBUG_MODE) {
+        api.v1.log(`Deleting condensed lorebook entry: ${range.lorebookEntryId}`);
+    }
+    await api.v1.lorebook.removeEntry(range.lorebookEntryId);
+
+    // Regenerate individual summaries for each chapter in the range
+    for (let chapterNum = range.startChapter; chapterNum <= range.endChapter; chapterNum++) {
+        if (DEBUG_MODE) {
+            api.v1.log(`Expanding chapter ${chapterNum}...`);
+        }
+
+        // Get chapter text
+        let chapterText: string;
+        if (chapterNum === 1) {
+            chapterText = chapters[0] || "";
+        } else {
+            const chapterIndex = chapterNum - 1;
+            chapterText = chapters[chapterIndex] || "";
+        }
+
+        if (!chapterText || chapterText.trim().length === 0) {
+            if (DEBUG_MODE) {
+                api.v1.log(`⚠️ Chapter ${chapterNum} text is empty, skipping`);
+            }
+            continue;
+        }
+
+        const title: string | null = extractChapterTitle(chapterText);
+        const chapterTitle: string = title || `Chapter ${chapterNum}`;
+
+        // v1.4.1: Increment generation counter for expansion
+        generationCounter++;
+        if (DEBUG_MODE) {
+            api.v1.log(`Expansion generation counter: ${generationCounter}/5 for chapter ${chapterNum}`);
+        }
+
+        // Generate summary
+        const summaryPrompt: string = promptString.replace("{chapter_text}", chapterText).replace("{chapter_title}", chapterTitle);
+        const messages: Message[] = [{
+            role: "user",
+            content: summaryPrompt
+        }];
+
+        const params: GenerationParams = await api.v1.generationParameters.get();
+        params.max_tokens = summaryMaxtokens;
+
+        try {
+            const result: GenerationResponse = await retryableGenerate(messages, params, chapterNum);
+            const summaryText: string = result.choices[0].text.trim();
+
+            // Create formatted entry text
+            const entryText: string = `Chapter ${chapterNum}: ${chapterTitle}\nType: chapter\nSummary: ${summaryText}`;
+
+            // Create new lorebook entry
+            const newEntryId = api.v1.uuid();
+            await api.v1.lorebook.createEntry({
+                id: newEntryId,
+                displayName: chapterTitle,
+                text: entryText,
+                category: lorebookCategoryId,
+                enabled: true,
+                forceActivation: true,
+                hidden: false,
+                keys: undefined,
+            });
+
+            // v1.4.1 FIX: Only update fingerprint if this chapter wasn't changed
+            // If it was changed, leave the OLD hash so detection still shows it as changed
+            // and it will be regenerated by the auto-regeneration system
+            if (changedChapterNumbers.has(chapterNum)) {
+                if (DEBUG_MODE) {
+                    api.v1.log(`⚠️ Chapter ${chapterNum} is in changed list - NOT updating fingerprint (will regenerate)`);
+                }
+                // Just mark as not condensed, but keep old hash
+                const fingerprints: ChapterFingerprint[] = await getChapterFingerprints();
+                const fp = fingerprints.find(f => f.chapterNumber === chapterNum);
+                if (fp) {
+                    fp.isCondensed = false;
+                    await api.v1.storyStorage.set("chapterFingerprints", fingerprints);
+                }
+            } else {
+                // Chapter unchanged - update fingerprint with current text
+                await storeChapterFingerprint(chapterNum, chapterText, false);
+            }
+
+            if (DEBUG_MODE) {
+                api.v1.log(`✓ Expanded chapter ${chapterNum} successfully`);
+            }
+
+        } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            api.v1.error(`Failed to expand chapter ${chapterNum}:`, errorMsg);
+            // Continue with other chapters even if one fails
+        }
+    }
+
+    // Remove the condensed range from storage
+    const condensedRanges: CondensedRange[] = await api.v1.storyStorage.get("condensedRanges") || [];
+    const updatedRanges = condensedRanges.filter(r => r.id !== range.id);
+    await api.v1.storyStorage.set("condensedRanges", updatedRanges);
+
+    if (DEBUG_MODE) {
+        api.v1.log(`✓ Condensed range ${range.startChapter}-${range.endChapter} fully expanded`);
+    }
+}
+
+/**
  * Regenerate summary for a specific changed chapter
+ * MODIFIED in v1.4.1: Detects condensed chapters and expands entire range
  * 
  * TODO: Optimize to not scan entire document again
  * 
@@ -369,10 +622,46 @@ async function detectChangedChapters(): Promise<ChangedChapter[]> {
 async function regenerateChapter(chapterNumber: number): Promise<void> {
     api.v1.log(`=== Regenerating chapter ${chapterNumber} summary ===`);
 
+    // v1.4.1: Check if this chapter is part of a condensed range
+    const condensedRange = await findCondensedRangeForChapter(chapterNumber);
+    
+    if (condensedRange) {
+        api.v1.log(`⚠️ Chapter ${chapterNumber} is part of condensed range ${condensedRange.startChapter}-${condensedRange.endChapter}`);
+        api.v1.log(`Expanding entire range to regenerate individual summaries...`);
+        
+        // Expand the entire condensed range
+        await expandCondensedRange(condensedRange);
+        
+        // Remove all chapters in the range from changed chapters list
+        const changedChapters: ChangedChapter[] = await getChangedChapters();
+        const updatedChanged = changedChapters.filter(c => 
+            c.chapterNumber < condensedRange.startChapter || c.chapterNumber > condensedRange.endChapter
+        );
+        await setChangedChapters(updatedChanged);
+        
+        api.v1.log(`✓ Condensed range expanded and regenerated`);
+        
+        // v1.4.1: Check if condensation is needed after expanding range
+        if (DEBUG_MODE) {
+            api.v1.log("Checking if condensation needed after range expansion...");
+        }
+        
+        try {
+            await checkAndCondenseIfNeeded();
+        } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            api.v1.error("Error during post-expansion condensation check:", errorMsg);
+            // Don't fail the entire operation, just log the error
+        }
+        
+        await updateStatusPanel();
+        return;
+    }
+
     // Get current chapter text
     const sections: DocumentSections = await api.v1.document.scan();
     const fullText = sections.map(s => s.section.text).join('\n');
-    const chapters: string[] = fullText.split(chapterBreakToken);
+    const chapters: string[] = splitIntoChapters(fullText);
 
     let chapterText: string;
     if (chapterNumber === 1) {
@@ -399,7 +688,8 @@ async function regenerateChapter(chapterNumber: number): Promise<void> {
         if (!entry.text) continue;
 
         // Check if this is the entry for this chapter
-        const chapterMatch = entry.text.match(/^Chapter (\d+)(?:-(\d+))?/);
+        // v1.4.1 FIX: Support both "Chapter" and "Chapters" for condensed entries
+        const chapterMatch = entry.text.match(/^Chapters? (\d+)(?:-(\d+))?/);
         if (!chapterMatch) continue;
 
         const startChapter: number = parseInt(chapterMatch[1]);
@@ -588,9 +878,8 @@ async function analyzeRebuild(): Promise<RebuildAnalysis> {
         api.v1.log(`Detected ${detectedChapterCount} chapters in document`);
     }
 
-    // Split into chapters
-    // TODO - need to factor in summarizeAllBreaks mode here
-    const chapters: string[] = fullText.split(chapterBreakToken);
+    // Split into chapters (respects summarizeAllBreaks config in v1.4.0)
+    const chapters: string[] = splitIntoChapters(fullText);
 
     // Get existing fingerprints
     const existingFingerprints: ChapterFingerprint[] = await getChapterFingerprints();
@@ -806,6 +1095,12 @@ async function showRebuildPreview(analysis: RebuildAnalysis): Promise<any> {
                             }
                             // Start the rebuild process
                             try {
+                                // v1.4.1: Reset generation counter before rebuild
+                                generationCounter = 0;
+                                if (DEBUG_MODE) {
+                                    api.v1.log("Reset generation counter before rebuild");
+                                }
+
                                 await performFullRebuild(analysis);
                             } catch (error) {
                                 // Error handling done inside performFullRebuild
@@ -1335,7 +1630,8 @@ async function findEntryByChapterNumber(chapterNumber: number, categoryId: strin
         if (!entry.text) continue;
 
         // Parse chapter range from entry text
-        const chapterMatch = entry.text.match(/^Chapter (\d+)(?:-(\d+))?/);
+        // v1.4.1 FIX: Support both "Chapter" and "Chapters" for condensed entries
+        const chapterMatch = entry.text.match(/^Chapters? (\d+)(?:-(\d+))?/);
         if (!chapterMatch) continue;
 
         const startChapter: number = parseInt(chapterMatch[1]);
@@ -1448,7 +1744,7 @@ async function performFullRebuild(analysis: RebuildAnalysis): Promise<void> {
         // Get document text once (for efficiency)
         const sections: DocumentSections = await api.v1.document.scan();
         const fullText = sections.map(s => s.section.text).join('\n');
-        const chapters = fullText.split(chapterBreakToken);
+        const chapters = splitIntoChapters(fullText);
 
         for (const action of analysis.actions) {
             progressCount++;
@@ -1553,6 +1849,12 @@ async function performFullRebuild(analysis: RebuildAnalysis): Promise<void> {
 
                     if (DEBUG_MODE) {
                         api.v1.log(`${actionVerb} summary for chapter ${action.chapterNumber}`);
+                    }
+
+                    // v1.4.1: Increment generation counter for rebuild operations
+                    generationCounter++;
+                    if (DEBUG_MODE) {
+                        api.v1.log(`Generation counter: ${generationCounter}/5 for chapter ${action.chapterNumber}`);
                     }
 
                     // Extract Title
@@ -1682,6 +1984,24 @@ async function performFullRebuild(analysis: RebuildAnalysis): Promise<void> {
 
         // Update status panel
         await updateStatusPanel();
+
+        // v1.4.1: Check if condensation is needed after rebuild
+        try {
+            if (DEBUG_MODE) {
+                api.v1.log("Checking if condensation is needed after rebuild...");
+            }
+            await checkAndCondenseIfNeeded();
+        } catch (condenseError) {
+            const condenseErrorMsg = condenseError instanceof Error ? condenseError.message : String(condenseError);
+            api.v1.error("Error during post-rebuild condensation check:", condenseErrorMsg);
+            // Don't fail the rebuild for condensation errors
+        }
+
+        // v1.4.1: Reset generation counter after rebuild
+        generationCounter = 0;
+        if (DEBUG_MODE) {
+            api.v1.log("Reset generation counter after rebuild");
+        }
 
         // Show success message
         api.v1.ui.larry.help({
@@ -2135,6 +2455,509 @@ async function detectAndShowChanges(): Promise<void> {
     }
 }
 
+// ============================================================================
+// AUTO-DETECTION & AUTO-REGENERATION FUNCTIONS (NEW IN v1.4.0)
+// ============================================================================
+
+/**
+ * v1.4.0: Automatically detect changed chapters after user generation
+ * Called from onResponse hook when user performs a generation
+ */
+async function autoDetectChanges(): Promise<void> {
+    if (!autoDetectOnGeneration) {
+        if (DEBUG_MODE) {
+            api.v1.log("Auto-detection disabled by config");
+        }
+        return;
+    }
+
+    if (DEBUG_MODE) {
+        api.v1.log("=== Auto-Detecting Changed Chapters ===");
+    }
+
+    try {
+        // Detect changed chapters
+        const changedChapters: ChangedChapter[] = await detectChangedChapters();
+        
+        // Update timestamp for UI display
+        lastAutoCheckTimestamp = Date.now();
+        
+        if (changedChapters.length === 0) {
+            if (DEBUG_MODE) {
+                api.v1.log("No changed chapters detected");
+            }
+            
+            // Clear notification
+            autoDetectionNotification = "";
+            await updateStatusPanel();
+            return;
+        }
+
+        // Build notification message
+        const chaptersList = changedChapters.map(ch => 
+            ch.title || `Chapter ${ch.chapterNumber}`
+        ).join(", ");
+        
+        autoDetectionNotification = `🔔 ${changedChapters.length} changed chapter(s) detected: ${chaptersList}`;
+        
+        if (DEBUG_MODE) {
+            api.v1.log(`Detected ${changedChapters.length} changed chapters`);
+        }
+
+        // If auto-regenerate is enabled, start regenerating
+        if (autoRegenerate) {
+            await autoRegenerateChanges(changedChapters);
+        } else {
+            // Just show notification
+            await updateStatusPanel();
+        }
+
+    } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        api.v1.error("Error during auto-detection:", errorMsg);
+        
+        autoDetectionNotification = `❌ Auto-detection failed: ${errorMsg}`;
+        await updateStatusPanel();
+    }
+}
+
+/**
+ * v1.4.1: Check if auto-regeneration would exceed token budget
+ * Shows modal to user if budget would be exceeded
+ * 
+ * @param changedChapters Array of chapters to be regenerated
+ * @returns Promise<boolean> true if user wants to proceed, false if cancelled
+ */
+async function checkTokenBudgetForAutoRegeneration(changedChapters: ChangedChapter[]): Promise<boolean> {
+    if (DEBUG_MODE) {
+        api.v1.log("=== Checking Token Budget for Auto-Regeneration ===");
+    }
+
+    // Get current token count
+    const currentTokens = await getTotalSummaryTokens();
+    
+    // v1.4.1 FIX: Re-read config values to handle runtime config changes
+    const currentMaxTokens = await api.v1.config.get("max_total_summary_tokens") || maxTotalSummaryTokens;
+    const currentThresholdPercent = await api.v1.config.get("condensation_threshold") || condensationThreshold;
+    
+    // Estimate tokens after regeneration
+    // Assumption: Average chapter summary is ~200 tokens (conservative estimate)
+    const averageChapterTokens: number = 200;
+    const estimatedNewTokens: number = changedChapters.length * averageChapterTokens;
+    const estimatedTotalTokens: number = currentTokens + estimatedNewTokens;
+
+    if (DEBUG_MODE) {
+        api.v1.log(`Current tokens: ${currentTokens}`);
+        api.v1.log(`Estimated new tokens: ${estimatedNewTokens} (${changedChapters.length} × ${averageChapterTokens})`);
+        api.v1.log(`Estimated total: ${estimatedTotalTokens}/${currentMaxTokens}`);
+    }
+
+    // Calculate threshold (same as condensation threshold)
+    const threshold = currentMaxTokens * (currentThresholdPercent / 100);
+
+    // If we're safely under threshold, proceed without prompt
+    if (estimatedTotalTokens <= threshold) {
+        if (DEBUG_MODE) {
+            api.v1.log("✓ Token budget OK, proceeding with auto-regeneration");
+        }
+        return true;
+    }
+
+    // We might exceed threshold - show warning modal
+    if (DEBUG_MODE) {
+        api.v1.log(`⚠️ Estimated tokens (${estimatedTotalTokens}) would exceed threshold (${threshold})`);
+    }
+
+    const percentOfLimit = Math.round((estimatedTotalTokens / currentMaxTokens) * 100);
+    const wouldExceedHardLimit = estimatedTotalTokens > currentMaxTokens;
+
+    let modalContent = `**Token Budget Warning**\n\n`;
+    modalContent += `Auto-regenerating ${changedChapters.length} chapter(s) may exceed your token budget:\n\n`;
+    modalContent += `- **Current:** ${currentTokens} tokens\n`;
+    modalContent += `- **Estimated After:** ${estimatedTotalTokens} tokens (${percentOfLimit}% of limit)\n`;
+    modalContent += `- **Your Limit:** ${currentMaxTokens} tokens\n`;
+    modalContent += `- **Threshold:** ${threshold} tokens (${currentThresholdPercent}%)\n\n`;
+
+    if (wouldExceedHardLimit) {
+        modalContent += `⚠️ **This would exceed your hard limit!** Automatic condensation will trigger to reduce token usage.\n\n`;
+    } else {
+        modalContent += `⚠️ **This would exceed your condensation threshold.** Older chapters may be automatically condensed.\n\n`;
+    }
+
+    modalContent += `**Your Options:**\n`;
+    modalContent += `- **Proceed Anyway:** Auto-regenerate all chapters. Condensation will handle token management automatically.\n`;
+    modalContent += `- **Cancel:** Keep chapters in changed list. Regenerate manually later (recommended if you want to review first).\n\n`;
+    modalContent += `_This is just an estimate. Actual token usage may vary._`;
+
+    return new Promise((resolve) => {
+        const modal = api.v1.ui.modal.open({
+            title: wouldExceedHardLimit ? "⚠️ Token Limit Would Be Exceeded" : "⚠️ Token Budget Warning",
+            size: "medium",
+            content: [
+                {
+                    type: "text",
+                    text: modalContent,
+                    markdown: true,
+                    style: { marginBottom: "16px" }
+                },
+                {
+                    type: "row",
+                    spacing: "end",
+                    content: [
+                        {
+                            type: "button",
+                            text: "Cancel",
+                            iconId: "x",
+                            callback: () => {
+                                if (DEBUG_MODE) {
+                                    api.v1.log("User cancelled auto-regeneration due to token budget");
+                                }
+                                modal.close();
+                                resolve(false);
+                            },
+                            style: { marginRight: "8px" }
+                        },
+                        {
+                            type: "button",
+                            text: "Proceed Anyway",
+                            iconId: "check",
+                            callback: () => {
+                                if (DEBUG_MODE) {
+                                    api.v1.log("User chose to proceed with auto-regeneration despite token budget warning");
+                                }
+                                modal.close();
+                                resolve(true);
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+    });
+}
+
+/**
+ * v1.4.1: Check token budget after any generation
+ * Shows warning modal when approaching threshold, forces condensation when over limit
+ */
+async function checkTokenBudgetAfterGeneration(): Promise<void> {
+    if (DEBUG_MODE) {
+        api.v1.log("=== Checking Token Budget After Generation ===");
+    }
+
+    // Get current token count
+    const currentTokens = await getTotalSummaryTokens();
+    
+    // Re-read config values to handle runtime config changes
+    const currentMaxTokens = await api.v1.config.get("max_total_summary_tokens") || maxTotalSummaryTokens;
+    const currentThresholdPercent = await api.v1.config.get("condensation_threshold") || condensationThreshold;
+    
+    const threshold = currentMaxTokens * (currentThresholdPercent / 100);
+    const percentUsed = Math.round((currentTokens / currentMaxTokens) * 100);
+
+    if (DEBUG_MODE) {
+        api.v1.log(`Current tokens: ${currentTokens}/${currentMaxTokens} (${percentUsed}%)`);
+        api.v1.log(`Threshold: ${threshold} (${currentThresholdPercent}%)`);
+        api.v1.log(`Over threshold: ${currentTokens > threshold}`);
+        api.v1.log(`Over max: ${currentTokens > currentMaxTokens}`);
+    }
+
+    // Case 1: Over the hard limit - FORCE condensation immediately
+    if (currentTokens > currentMaxTokens) {
+        if (DEBUG_MODE) {
+            api.v1.log("🚨 OVER MAX TOKEN LIMIT - Forcing condensation");
+        }
+
+        // Clear the warning flag (will show again next time if still approaching)
+        condensationWarningShown = false;
+
+        // Show forcing modal
+        api.v1.ui.larry.help({
+            question: `🚨 **Token Limit Exceeded!**\n\nYour summaries are now using **${currentTokens} tokens** (${percentUsed}% of your ${currentMaxTokens} token limit).\n\n**Automatic condensation will now run** to reduce token usage.`,
+            options: [
+                { text: "OK", callback: () => {} }
+            ]
+        });
+
+        // Force condensation
+        await checkAndCondenseIfNeeded();
+        await updateStatusPanel();
+        return;
+    }
+
+    // Case 2: Over threshold but under max - show warning modal (once per session)
+    if (currentTokens > threshold && !condensationWarningShown) {
+        if (DEBUG_MODE) {
+            api.v1.log(`⚠️ Over threshold (${currentThresholdPercent}%) - showing warning modal`);
+        }
+
+        condensationWarningShown = true; // Don't show again until next time we're under threshold
+
+        const modal = api.v1.ui.modal.open({
+            title: "⚠️ Token Budget Warning",
+            size: "medium",
+            content: [
+                {
+                    type: "text",
+                    text: `**You're approaching your token limit!**\n\n` +
+                        `- **Current Usage:** ${currentTokens} tokens (${percentUsed}%)\n` +
+                        `- **Your Limit:** ${currentMaxTokens} tokens\n` +
+                        `- **Threshold:** ${threshold} tokens (${currentThresholdPercent}%)\n\n` +
+                        `**What happens next:**\n` +
+                        `- If you continue generating, older chapter summaries will be automatically condensed to free up tokens.\n` +
+                        `- If you exceed the hard limit (${currentMaxTokens} tokens), condensation will be forced immediately.\n\n` +
+                        `**Your options:**\n` +
+                        `- **Condense Now:** Manually trigger condensation to reduce token usage.\n` +
+                        `- **Continue:** Keep generating. Auto-condensation will handle it when needed.\n` +
+                        `- **Review Settings:** Adjust your token limits in the script config.`,
+                    markdown: true,
+                    style: { marginBottom: "16px" }
+                },
+                {
+                    type: "row",
+                    spacing: "end",
+                    content: [
+                        {
+                            type: "button",
+                            text: "Continue",
+                            iconId: "check",
+                            callback: () => {
+                                if (DEBUG_MODE) {
+                                    api.v1.log("User chose to continue without condensing");
+                                }
+                                modal.close();
+                            },
+                            style: { marginRight: "8px" }
+                        },
+                        {
+                            type: "button",
+                            text: "Condense Now",
+                            iconId: "zap",
+                            callback: async () => {
+                                if (DEBUG_MODE) {
+                                    api.v1.log("User chose to condense now");
+                                }
+                                modal.close();
+                                await manualCondense();
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        return;
+    }
+
+    // Case 3: Under threshold - clear warning flag so it can show again
+    if (currentTokens <= threshold && condensationWarningShown) {
+        if (DEBUG_MODE) {
+            api.v1.log("✓ Back under threshold - clearing warning flag");
+        }
+        condensationWarningShown = false;
+    }
+
+    if (DEBUG_MODE) {
+        api.v1.log("✓ Token budget OK");
+    }
+}
+
+/**
+ * v1.4.0: Automatically regenerate changed chapters
+ * Respects the 5-generation limit enforced by NovelAI
+ * MODIFIED in v1.4.1: Added token budget check before regeneration
+ * 
+ * @param changedChapters Array of detected changed chapters
+ */
+async function autoRegenerateChanges(changedChapters: ChangedChapter[]): Promise<void> {
+    if (DEBUG_MODE) {
+        api.v1.log(`=== Auto-Regenerating ${changedChapters.length} Changed Chapters ===`);
+        api.v1.log(`Current generation counter: ${generationCounter}`);
+    }
+
+    // v1.4.1: Check token budget before regenerating
+    const shouldProceed = await checkTokenBudgetForAutoRegeneration(changedChapters);
+    if (!shouldProceed) {
+        if (DEBUG_MODE) {
+            api.v1.log("User cancelled auto-regeneration due to token budget concerns");
+        }
+        autoDetectionNotification = `⚠️ Auto-regeneration cancelled (token budget). ${changedChapters.length} chapters pending.`;
+        await updateStatusPanel();
+        return;
+    }
+
+    // Set flag to prevent onResponse hook from interfering
+    autoRegenerationInProgress = true;
+
+    try {
+        for (const ch of changedChapters) {
+        // Check generation limit BEFORE attempting regeneration
+        if (generationCounter >= 4) {
+            // At 4 generations - show modal asking if user wants to continue
+            if (DEBUG_MODE) {
+                api.v1.log(`Generation counter at ${generationCounter} - showing limit modal`);
+            }
+            
+            const shouldContinue = await showGenerationLimitModal(changedChapters, ch.chapterNumber);
+            
+            if (!shouldContinue) {
+                // User chose "Skip for Now" - leave remaining chapters in changed list
+                if (DEBUG_MODE) {
+                    api.v1.log("User skipped remaining auto-regenerations");
+                }
+                
+                autoDetectionNotification = `⚠️ Generation limit reached. ${changedChapters.length} chapters still pending.`;
+                await updateStatusPanel();
+                return;
+            }
+            
+            // User chose "Continue" - reset counter and proceed
+            generationCounter = 0;
+        }
+
+        try {
+            if (DEBUG_MODE) {
+                api.v1.log(`Auto-regenerating chapter ${ch.chapterNumber} (${generationCounter + 1}/5)`);
+            }
+            
+            // Increment generation counter BEFORE regenerating
+            generationCounter++;
+            
+            // Update notification to show progress
+            autoDetectionNotification = `🔄 Auto-regenerating: Chapter ${ch.chapterNumber}... (${generationCounter}/5)`;
+            await updateStatusPanel();
+            
+            // Perform regeneration
+            await regenerateChapter(ch.chapterNumber);
+            
+            if (DEBUG_MODE) {
+                api.v1.log(`✓ Successfully auto-regenerated chapter ${ch.chapterNumber}`);
+            }
+
+        } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            api.v1.error(`Failed to auto-regenerate chapter ${ch.chapterNumber}:`, errorMsg);
+            
+            // Continue with next chapter even if this one failed
+            continue;
+        }
+    }
+
+        // All done
+        autoDetectionNotification = `✅ Auto-regeneration complete! Processed ${changedChapters.length} chapter(s).`;
+        await updateStatusPanel();
+        
+        if (DEBUG_MODE) {
+            api.v1.log("=== Auto-Regeneration Complete ===");
+        }
+
+        // v1.4.1: Check if condensation is needed after regenerating multiple chapters
+        if (DEBUG_MODE) {
+            api.v1.log("Checking if condensation needed after auto-regeneration...");
+        }
+        
+        try {
+            await checkAndCondenseIfNeeded();
+        } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            api.v1.error("Error during post-regeneration condensation check:", errorMsg);
+            // Don't fail the entire operation, just log the error
+        }
+        
+    } finally {
+        // Always clear flag when done
+        autoRegenerationInProgress = false;
+    }
+}
+
+/**
+ * v1.4.0: Show modal when generation limit (4/5) is reached
+ * Allows user to either continue or skip remaining regenerations
+ * 
+ * @param remainingChapters All chapters that still need regeneration
+ * @param currentChapter The chapter we're about to regenerate
+ * @returns Promise<boolean> true if user wants to continue, false if skipping
+ */
+async function showGenerationLimitModal(
+    remainingChapters: ChangedChapter[],
+    currentChapter: number
+): Promise<boolean> {
+    if (DEBUG_MODE) {
+        api.v1.log("Showing generation limit modal");
+    }
+
+    // Calculate how many chapters are left (including current)
+    const currentIndex = remainingChapters.findIndex(ch => ch.chapterNumber === currentChapter);
+    const chaptersRemaining = remainingChapters.length - currentIndex;
+
+    let modalContent = `**Generation Limit Warning**\n\n`;
+    modalContent += `We've used 4 out of 5 non-interactive generations allowed by NovelAI.\n\n`;
+    modalContent += `**Remaining Chapters to Regenerate:** ${chaptersRemaining}\n\n`;
+    modalContent += `**Your Options:**\n`;
+    modalContent += `- **Continue:** Reset the counter and auto-regenerate the remaining chapter(s)\n`;
+    modalContent += `- **Skip for Now:** Stop auto-regeneration. You can manually regenerate later from the panel.\n\n`;
+    modalContent += `_The generation counter resets automatically when you generate text in the editor or interact with the UI._`;
+
+    return new Promise((resolve) => {
+        const modal = api.v1.ui.modal.open({
+            title: "⚠️ Generation Limit Reached",
+            size: "medium",
+            content: [
+                {
+                    type: "text",
+                    text: modalContent,
+                    markdown: true,
+                    style: { marginBottom: "16px" }
+                },
+                {
+                    type: "row",
+                    spacing: "end",
+                    content: [
+                        {
+                            type: "button",
+                            text: "Skip for Now",
+                            iconId: "x",
+                            callback: () => {
+                                if (DEBUG_MODE) {
+                                    api.v1.log("User chose to skip remaining auto-regenerations");
+                                }
+                                modal.close();
+                                resolve(false);
+                            },
+                            style: { marginRight: "8px" }
+                        },
+                        {
+                            type: "button",
+                            text: "Continue",
+                            iconId: "refresh",
+                            callback: () => {
+                                if (DEBUG_MODE) {
+                                    api.v1.log("User chose to continue auto-regenerations");
+                                }
+                                modal.close();
+                                resolve(true);
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+    });
+}
+
+/**
+ * v1.4.0: Dismiss the current auto-detection notification
+ * Called when user clicks dismiss button in UI
+ */
+async function dismissAutoDetectionNotification(): Promise<void> {
+    if (DEBUG_MODE) {
+        api.v1.log("Dismissing auto-detection notification");
+    }
+    
+    autoDetectionNotification = "";
+    await updateStatusPanel();
+}
+
 
 /**
  * Wait for the editor to be ready for background generation
@@ -2276,7 +3099,8 @@ async function getChapterSummaryEntries(): Promise<ChapterSummaryEntry[]> {
         if (!entry.text) continue;
 
         // Parse the entry to extract chapter info
-        const chapterMatch = entry.text.match(/^Chapter (\d+)(?:-(\d+))?/);
+        // v1.4.1 FIX: Support both "Chapter" and "Chapters" for condensed entries
+        const chapterMatch = entry.text.match(/^Chapters? (\d+)(?:-(\d+))?/);
         if (!chapterMatch) continue;
 
         const startChapter = parseInt(chapterMatch[1]);
@@ -2375,6 +3199,12 @@ Provide a concise narrative summary that captures the key plot points, character
     let generatedSummaryParams = await api.v1.generationParameters.get();
     generatedSummaryParams.max_tokens = summaryMaxtokens;
 
+    // v1.4.1: Increment generation counter for condensation
+    generationCounter++;
+    if (DEBUG_MODE) {
+        api.v1.log(`Condensation generation counter: ${generationCounter}/5`);
+    }
+
     // Generate the condensed summary
     const generatedSummary = await retryableGenerate(messages, generatedSummaryParams, entriesToCondense[0].chapterNumber);
     const summaryText = generatedSummary.choices[0].text.trim();
@@ -2426,8 +3256,11 @@ Provide a concise narrative summary that captures the key plot points, character
     await api.v1.storyStorage.set("condensedRanges", condensedRanges);
 
 
-    // Mark chapters as condensed in fingerprints
+    // v1.4.1: Mark chapters as condensed in fingerprints with enhanced tracking
     const fingerprints: ChapterFingerprint[] = await getChapterFingerprints();
+    const startChapterNum = entriesToCondense[0].startChapter;
+    const endChapterNum = entriesToCondense[entriesToCondense.length - 1].endChapter;
+    
     for (const entry of entriesToCondense) {
         const fp = fingerprints.find(f => f.chapterNumber === entry.chapterNumber);
         if (fp) {
@@ -2435,6 +3268,10 @@ Provide a concise narrative summary that captures the key plot points, character
         }
     }
     await api.v1.storyStorage.set("chapterFingerprints", fingerprints);
+
+    if (DEBUG_MODE) {
+        api.v1.log(`✓ Marked chapters ${startChapterNum}-${endChapterNum} as condensed in fingerprints`);
+    }
 
     api.v1.log(`✓ Created condensed entry: ${condensedTitle} (${tokens.length} tokens)`);
     return entryId;
@@ -2524,23 +3361,28 @@ async function performEmergencyCondensation(): Promise<void> {
  */
 async function checkAndCondenseIfNeeded(): Promise<void> {
     const currentTokens = await getTotalSummaryTokens();
-    const threshold = maxTotalSummaryTokens * (condensationThreshold / 100);
+    
+    // v1.4.1 FIX: Re-read config values to handle runtime config changes
+    const currentMaxTokens = await api.v1.config.get("max_total_summary_tokens") || maxTotalSummaryTokens;
+    const currentThresholdPercent = await api.v1.config.get("condensation_threshold") || condensationThreshold;
+    
+    const threshold = currentMaxTokens * (currentThresholdPercent / 100);
 
     if (currentTokens <= threshold) {
         if (DEBUG_MODE) {
-            api.v1.log(`Token count OK: ${currentTokens}/${maxTotalSummaryTokens} (threshold: ${threshold})`);
+            api.v1.log(`Token count OK: ${currentTokens}/${currentMaxTokens} (threshold: ${threshold})`);
         }
         return;
     }
 
-    api.v1.log(`⚠️ Token limit reached: ${currentTokens}/${maxTotalSummaryTokens} tokens (threshold: ${threshold})`);
+    api.v1.log(`⚠️ Token limit reached: ${currentTokens}/${currentMaxTokens} tokens (threshold: ${threshold})`);
 
     try {
         // Try Level 1: Normal condensation
         await performNormalCondensation();
 
         const tokensAfterLevel1 = await getTotalSummaryTokens();
-        if (tokensAfterLevel1 <= maxTotalSummaryTokens) {
+        if (tokensAfterLevel1 <= currentMaxTokens) {
             api.v1.log("✓ Normal condensation resolved token pressure");
             await updateStatusPanel();
             return;
@@ -2551,7 +3393,7 @@ async function checkAndCondenseIfNeeded(): Promise<void> {
         await performAggressiveCondensation();
 
         const tokensAfterLevel2 = await getTotalSummaryTokens();
-        if (tokensAfterLevel2 <= maxTotalSummaryTokens) {
+        if (tokensAfterLevel2 <= currentMaxTokens) {
             api.v1.log("✓ Aggressive condensation resolved token pressure");
             await updateStatusPanel();
             return;
@@ -2562,7 +3404,7 @@ async function checkAndCondenseIfNeeded(): Promise<void> {
         await performEmergencyCondensation();
 
         const tokensAfterLevel3 = await getTotalSummaryTokens();
-        if (tokensAfterLevel3 <= maxTotalSummaryTokens) {
+        if (tokensAfterLevel3 <= currentMaxTokens) {
             api.v1.log("✓ Emergency condensation resolved token pressure");
             await updateStatusPanel();
             return;
@@ -2753,11 +3595,16 @@ async function updateStatusPanel(): Promise<void> {
 
     // Get token usage
     const currentTokens = await getTotalSummaryTokens();
-    const threshold = maxTotalSummaryTokens * (condensationThreshold / 100);
-    const percentUsed = Math.round((currentTokens / maxTotalSummaryTokens) * 100);
+    
+    // v1.4.1 FIX: Re-read config values to handle runtime config changes
+    const currentMaxTokens = await api.v1.config.get("max_total_summary_tokens") || maxTotalSummaryTokens;
+    const currentThresholdPercent = await api.v1.config.get("condensation_threshold") || condensationThreshold;
+    
+    const threshold = currentMaxTokens * (currentThresholdPercent / 100);
+    const percentUsed = Math.round((currentTokens / currentMaxTokens) * 100);
 
     let tokenStatus = "✓";
-    if (currentTokens > maxTotalSummaryTokens) {
+    if (currentTokens > currentMaxTokens) {
         tokenStatus = "❌";
     } else if (currentTokens > threshold) {
         tokenStatus = "⚠️";
@@ -2769,9 +3616,9 @@ async function updateStatusPanel(): Promise<void> {
     const condensedEntries = entries.filter(e => e.isCondensed);
 
     let statusText = `**Token Usage:**\n`;
-    statusText += `${tokenStatus} ${currentTokens} / ${maxTotalSummaryTokens} tokens (${percentUsed}%)\n`;
+    statusText += `${tokenStatus} ${currentTokens} / ${currentMaxTokens} tokens (${percentUsed}%)\n`;
     if (currentTokens > threshold) {
-        statusText += `⚠️ Over ${condensationThreshold}% threshold\n`;
+        statusText += `⚠️ Over ${currentThresholdPercent}% threshold\n`;
     }
 
     // NEW in v1.2.1: Show background work indicator
@@ -2787,6 +3634,19 @@ async function updateStatusPanel(): Promise<void> {
     }
 
     statusText += `\n`;
+
+    // NEW in v1.4.0: Show auto-detection notification
+    if (autoDetectionNotification) {
+        statusText += `**Auto-Detection:**\n`;
+        statusText += `${autoDetectionNotification}\n`;
+        
+        if (lastAutoCheckTimestamp > 0) {
+            const minutesAgo = Math.round((Date.now() - lastAutoCheckTimestamp) / 1000 / 60);
+            statusText += `Last check: ${minutesAgo}m ago\n`;
+        }
+        
+        statusText += `\n`;
+    }
 
     statusText += `**Summary Breakdown:**\n`;
     if (detailedEntries.length > 0) {
@@ -2826,6 +3686,21 @@ async function updateStatusPanel(): Promise<void> {
             id: "changed-chapters-box",
             content: changedChaptersContent
         }]);
+
+        // v1.4.1: Clear temporary status messages to prevent stale UI
+        // Only clear if they're not currently showing active operations
+        if (!backgroundSummaryInProgress && !batchRegenerationInProgress) {
+            await api.v1.ui.updateParts([
+                {
+                    id: "retry-status",
+                    text: ""
+                },
+                {
+                    id: "rebuild-progress",
+                    text: ""
+                }
+            ]);
+        }
     } catch (error) {
         // Panel might not be open that's okay
         if (DEBUG_MODE) {
@@ -2850,6 +3725,12 @@ async function retryFailedChapters(): Promise<void> {
         return;
     }
 
+    // v1.4.1: Reset generation counter before retry
+    generationCounter = 0;
+    if (DEBUG_MODE) {
+        api.v1.log("Reset generation counter before retry");
+    }
+
     api.v1.log(`Attempting to retry ${failed.length} failed chapter(s)...`);
 
     await api.v1.ui.updateParts([{
@@ -2859,13 +3740,19 @@ async function retryFailedChapters(): Promise<void> {
 
     const sections: DocumentSections = await api.v1.document.scan();
     const fullText = sections.map(s => s.section.text).join('\n');
-    const chapters = fullText.split(chapterBreakToken);
+    const chapters = splitIntoChapters(fullText);
 
     let successCount = 0;
     let failCount = 0;
 
     for (const failedChapter of failed) {
         try {
+            // v1.4.1: Increment generation counter for each retry
+            generationCounter++;
+            if (DEBUG_MODE) {
+                api.v1.log(`Generation counter: ${generationCounter}/5 for chapter ${failedChapter.chapterNumber}`);
+            }
+
             api.v1.log(`Retrying chapter ${failedChapter.chapterNumber}...`);
 
             // Get the chapter text
@@ -2909,6 +3796,12 @@ async function retryFailedChapters(): Promise<void> {
         id: "retry-status",
         text: statusMsg
     }]);
+
+    // v1.4.1: Reset generation counter after retry
+    generationCounter = 0;
+    if (DEBUG_MODE) {
+        api.v1.log("Reset generation counter after retry");
+    }
 
     await updateStatusPanel();
 }
@@ -3001,18 +3894,39 @@ async function checkIfSummaryNeeded(recentText: string): Promise<boolean> {
     const breakPattern = new RegExp(`(?:^|\\n)\\s*${escapedToken}\\s*(?=\\n|$)`, 'gm');
     const chapterBreakCount = (fullText.match(breakPattern) || []).length;
 
-    // Check if we've already processed this many chapters
-    const lastProcessedCount = await api.v1.storyStorage.get("lastProcessedChapterCount") || 0;
-    const pendingChapter = await api.v1.storyStorage.get("pendingChapter") || 0;
-
     if (DEBUG_MODE) {
-        api.v1.log(`Chapter break count: ${chapterBreakCount}, Last processed: ${lastProcessedCount}, Pending: ${pendingChapter}`);
+        api.v1.log(`Chapter break count: ${chapterBreakCount}`);
     }
 
-    // Don't process if already processed or currently pending
-    if (chapterBreakCount <= lastProcessedCount || pendingChapter === chapterBreakCount) {
+    // If there are NO chapter breaks yet, we're still writing chapter 1 - don't summarize
+    if (chapterBreakCount === 0) {
         if (DEBUG_MODE) {
-            api.v1.log("Chapter already processed or pending; skipping.");
+            api.v1.log("No chapter breaks found; still writing chapter 1; skipping.");
+        }
+        return false;
+    }
+
+    // The chapter to summarize is the one BEFORE the most recent break
+    // (We just finished it by adding a break, now we need to summarize it)
+    const chapterToSummarize = chapterBreakCount;
+
+    // Check if we're currently processing this chapter
+    const pendingChapter = await api.v1.storyStorage.get("pendingChapter") || 0;
+
+    if (pendingChapter === chapterToSummarize) {
+        if (DEBUG_MODE) {
+            api.v1.log(`Chapter ${chapterToSummarize} currently pending; skipping.`);
+        }
+        return false;
+    }
+
+    // Check if this specific chapter already has a fingerprint (meaning it was already summarized)
+    const fingerprints: ChapterFingerprint[] = await getChapterFingerprints();
+    const hasFingerprint = fingerprints.some(fp => fp.chapterNumber === chapterToSummarize);
+    
+    if (hasFingerprint) {
+        if (DEBUG_MODE) {
+            api.v1.log(`Chapter ${chapterToSummarize} already has fingerprint; skipping.`);
         }
         return false;
     }
@@ -3030,27 +3944,121 @@ async function checkIfSummaryNeeded(recentText: string): Promise<boolean> {
 
     if (summaryNeeded) {
         // Mark this chapter as pending
-        await api.v1.storyStorage.set("pendingChapter", chapterBreakCount);
+        await api.v1.storyStorage.set("pendingChapter", chapterToSummarize);
     }
 
     return summaryNeeded;
 }
 
+/**
+ * Extract chapter title from chapter text
+ * v1.4.0: Now respects summarizeAllBreaks config
+ * 
+ * @param chapterText The full text of the chapter
+ * @returns The extracted title, or null if none found
+ */
 function extractChapterTitle(chapterText: string): string | null {
-    let chapterTitle: string;
-
-    chapterTitle = chapterText.match(/\[(.*?)\]/)?.[1]?.trim() || "";
-
-    if (chapterTitle.length === 0) {
-        return null;
+    // Look for title pattern: text after opening bracket [
+    // Can have closing bracket ] or not
+    const bracketMatch = chapterText.match(/^\s*\[(.*?)(?:\]|$)/m);
+    
+    if (bracketMatch && bracketMatch[1]) {
+        const title = bracketMatch[1].trim();
+        if (title.length > 0) {
+            if (DEBUG_MODE) {
+                api.v1.log(`Extracted title from brackets: "${title}"`);
+            }
+            return title;
+        }
     }
 
-    return chapterTitle;
+    return null;
+}
+
+/**
+ * Check if text after a chapter break token is a valid chapter start
+ * v1.4.0: Implements summarizeAllBreaks logic
+ * 
+ * @param textAfterBreak Text immediately following a chapter break token
+ * @returns true if this is a valid chapter break
+ */
+function isValidChapterBreak(textAfterBreak: string): boolean {
+    if (summarizeAllBreaks) {
+        // All breaks are valid chapter breaks
+        return true;
+    }
+    
+    // Only valid if followed by opening bracket [
+    const trimmed = textAfterBreak.trimStart();
+    const hasOpeningBracket = trimmed.startsWith('[');
+    
+    if (DEBUG_MODE && !hasOpeningBracket) {
+        api.v1.log(`Skipping break - no opening bracket found (summarizeAllBreaks=false)`);
+    }
+    
+    return hasOpeningBracket;
+}
+
+/**
+ * Split document text into chapters, respecting summarizeAllBreaks config
+ * v1.4.0: New function to properly handle chapter splitting
+ * 
+ * @param fullText The complete document text
+ * @returns Array of chapter texts
+ */
+function splitIntoChapters(fullText: string): string[] {
+    if (summarizeAllBreaks) {
+        // Simple split - all breaks are chapters
+        return fullText.split(chapterBreakToken);
+    }
+    
+    // Complex split - only breaks followed by [ are chapters
+    const escapedToken = chapterBreakToken.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const breakPattern = new RegExp(`(?:^|\\n)\\s*${escapedToken}\\s*(?=\\n|$)`, 'gm');
+    
+    const chapters: string[] = [];
+    let lastIndex = 0;
+    let currentChapter = "";
+    
+    // Find all break positions
+    let match;
+    while ((match = breakPattern.exec(fullText)) !== null) {
+        const breakPos = match.index;
+        const textBeforeBreak = fullText.substring(lastIndex, breakPos);
+        const textAfterBreak = fullText.substring(breakPos + match[0].length);
+        
+        // Check if this is a valid chapter break
+        if (isValidChapterBreak(textAfterBreak)) {
+            // Save accumulated text as a chapter
+            currentChapter += textBeforeBreak;
+            if (currentChapter.trim().length > 0 || chapters.length === 0) {
+                chapters.push(currentChapter);
+            }
+            currentChapter = "";
+            lastIndex = breakPos + match[0].length;
+        } else {
+            // Not a valid break - include the break token in the current chapter
+            currentChapter += textBeforeBreak + match[0];
+            lastIndex = breakPos + match[0].length;
+        }
+    }
+    
+    // Add remaining text as final chapter
+    currentChapter += fullText.substring(lastIndex);
+    if (currentChapter.trim().length > 0 || chapters.length === 0) {
+        chapters.push(currentChapter);
+    }
+    
+    if (DEBUG_MODE) {
+        api.v1.log(`splitIntoChapters: Found ${chapters.length} valid chapters (summarizeAllBreaks=${summarizeAllBreaks})`);
+    }
+    
+    return chapters;
 }
 
 async function scanForPreviousChapter(sections: DocumentSections): Promise<{ text: string; title: string | null }> {
     const fullText = sections.map(s => s.section.text).join('\n');
-    const chapters = fullText.split(chapterBreakToken);
+    const chapters = splitIntoChapters(fullText);
 
     let chapterText: string;
 
@@ -3200,13 +4208,28 @@ async function generateChapterSummary(chapterData: { text: string; title: string
 
 /**
  * Hook: Called when generation completes
+ * MODIFIED in v1.4.0: Resets generation counter and triggers auto-detection
  * Checks if a chapter summary is needed and schedules generation
  */
 const onResponseHook: OnResponse = async (params) => {
     if (params.final) {
+        // v1.4.0: Skip if this is an auto-regeneration generation (prevents loops)
+        if (autoRegenerationInProgress) {
+            if (DEBUG_MODE) {
+                api.v1.log("Skipping onResponse hook - auto-regeneration in progress");
+            }
+            return;
+        }
+
         if (DEBUG_MODE) {
             api.v1.log("Generation complete, checking if summary needed...");
         }
+
+        // v1.4.0: Reset generation counter when user does a generation
+        if (DEBUG_MODE && generationCounter > 0) {
+            api.v1.log(`Resetting generation counter (was ${generationCounter})`);
+        }
+        generationCounter = 0;
 
         const sections: DocumentSections = await api.v1.document.scan();
         const fullText = sections.map(s => s.section.text).join('\n');
@@ -3254,6 +4277,42 @@ const onResponseHook: OnResponse = async (params) => {
         } else {
             if (DEBUG_MODE)
                 api.v1.log("Summary not needed (onResponse)");
+
+            // Update status panel anyway
+            await updateStatusPanel();
+        }
+
+        // v1.4.1: Check token budget after generation completes and handle condensation
+        await api.v1.timers.setTimeout(async () => {
+            try {
+                await checkTokenBudgetAfterGeneration();
+            } catch (error) {
+                const errorMsg = error instanceof Error ? error.message : String(error);
+                api.v1.error("Error checking token budget after generation:", errorMsg);
+            }
+        }, needsSummary ? 2000 : 500); // Wait for potential summary generation
+
+        // v1.4.0: Trigger auto-detection whenever there are chapters with summaries
+        // This catches changes to existing chapters even when continuing past the last chapter
+        const chapters = fullText.split(new RegExp(`(?:^|\\n)\\s*${chapterBreakToken.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*(?=\\n|$)`, 'gm'));
+        const chapterBreakCount = chapters.length - 1;
+
+        // Only run auto-detection if:
+        // 1. There are existing chapters (breaks > 0)
+        // 2. Auto-detect on generation is enabled
+        // 3. At least one chapter has a fingerprint (something to compare against)
+        if (chapterBreakCount > 0 && autoDetectOnGeneration) {
+            const fingerprints: ChapterFingerprint[] = await api.v1.storyStorage.get("chapterFingerprints") || [];
+            if (fingerprints.length > 0) {
+                // Schedule auto-detection after hook completes
+                const delay = needsSummary ? 3000 : 2000; // Longer delay if summary is generating
+                await api.v1.timers.setTimeout(async () => {
+                    if (DEBUG_MODE) {
+                        api.v1.log(needsSummary ? "Running auto-detection after new chapter summary..." : "Running auto-detection after generation...");
+                    }
+                    await autoDetectChanges();
+                }, delay);
+            }
         }
     }
 };
@@ -3296,6 +4355,10 @@ const onContextBuiltHook: OnContextBuilt = async (params) => {
 
     maxRebuildBackups = await api.v1.config.get("max_rebuild_backups") || 3;
 
+    // Load auto-detection config (v1.4.0)
+    autoDetectOnGeneration = await api.v1.config.get("auto_detect_on_generation") || false;
+    autoRegenerate = await api.v1.config.get("auto_regenerate") || false;
+
     // Load isFirstChapter from storage
     const storedFirstChapter = await api.v1.storyStorage.get("isFirstChapter");
     if (storedFirstChapter !== undefined) {
@@ -3316,10 +4379,12 @@ const onContextBuiltHook: OnContextBuilt = async (params) => {
         api.v1.log(`Config - Condensation Threshold: ${condensationThreshold}%`);
         api.v1.log(`Config - Recent Chapters To Keep: ${recentChaptersToKeep}`);
         api.v1.log(`Config - Chapters Per Group: ${chaptersPerCondensedGroup}`);
+        api.v1.log(`Config - Auto-Detect On Generation: ${autoDetectOnGeneration}`);
+        api.v1.log(`Config - Auto-Regenerate: ${autoRegenerate}`);
         api.v1.log(`State - isFirstChapter: ${isFirstChapter}`);
     }
 
-    api.v1.log(`Automatic Chapter Summaries v1.3.1 Initialized at: ${new Date().toLocaleString()}`);
+    api.v1.log(`Automatic Chapter Summaries v${SCRIPT_VERSION} Initialized at: ${new Date().toLocaleString()}`);
 
     // Try to load category ID from storage first
     lorebookCategoryId = await api.v1.storyStorage.get("chapterSummaryCategoryId") || "";
@@ -3355,7 +4420,7 @@ const onContextBuiltHook: OnContextBuilt = async (params) => {
             {
                 type: "text",
                 id: "panel-title",
-                text: `### Automatic Chapter Summaries v1.3.2\n\nManage chapter summary generation, token usage, condensation, and retroactive edits.`,
+                text: `### Automatic Chapter Summaries v${SCRIPT_VERSION}\n\nManage chapter summary generation, token usage, condensation, and retroactive edits.`,
                 markdown: true
             },
             {
@@ -3403,7 +4468,22 @@ const onContextBuiltHook: OnContextBuilt = async (params) => {
                         type: "button",
                         text: "Check for Changed Chapters",
                         iconId: "search",
-                        callback: detectAndShowChanges,
+                        callback: async () => {
+                            // v1.4.0: Reset generation counter when UI callback triggered
+                            generationCounter = 0;
+                            await detectAndShowChanges();
+                        },
+                        style: { marginRight: "8px" }
+                    },
+                    {
+                        type: "button",
+                        text: "Dismiss Notification",
+                        iconId: "x",
+                        callback: async () => {
+                            // v1.4.0: Reset generation counter when UI callback triggered
+                            generationCounter = 0;
+                            await dismissAutoDetectionNotification();
+                        },
                         style: { marginRight: "8px" }
                     }
                 ]
@@ -3416,21 +4496,33 @@ const onContextBuiltHook: OnContextBuilt = async (params) => {
                         type: "button",
                         text: "Retry Failed Chapters",
                         iconId: "refresh",
-                        callback: retryFailedChapters,
+                        callback: async () => {
+                            // v1.4.0: Reset generation counter when UI callback triggered
+                            generationCounter = 0;
+                            await retryFailedChapters();
+                        },
                         style: { marginRight: "8px" }
                     },
                     {
                         type: "button",
                         text: "Clear Failed Records",
                         iconId: "trash",
-                        callback: clearAllFailures,
+                        callback: async () => {
+                            // v1.4.0: Reset generation counter when UI callback triggered
+                            generationCounter = 0;
+                            await clearAllFailures();
+                        },
                         style: { marginRight: "8px" }
                     },
                     {
                         type: "button",
                         text: "Condense Now",
                         iconId: "zap",
-                        callback: manualCondense
+                        callback: async () => {
+                            // v1.4.0: Reset generation counter when UI callback triggered
+                            generationCounter = 0;
+                            await manualCondense();
+                        }
                     }
                 ]
             },
@@ -3452,7 +4544,11 @@ const onContextBuiltHook: OnContextBuilt = async (params) => {
                         type: "button",
                         text: "Rebuild All Summaries",
                         iconId: "refresh",
-                        callback: triggerRebuildPreview,
+                        callback: async () => {
+                            // v1.4.0: Reset generation counter when UI callback triggered
+                            generationCounter = 0;
+                            await triggerRebuildPreview();
+                        },
                         style: { marginBottom: "4px" }
                     },
                     {
@@ -3488,9 +4584,78 @@ const onContextBuiltHook: OnContextBuilt = async (params) => {
                     },
                     {
                         type: "text",
-                        text: "**Backup Functions:**",
+                        text: "**Fingerprint Functions:**",
                         markdown: true,
                         style: { marginBottom: "4px", fontSize: "0.9em" }
+                    },
+                    {
+                        type: "row",
+                        spacing: "start",
+                        content: [
+                            {
+                                type: "button",
+                                text: "Refresh All Fingerprints",
+                                iconId: "refresh",
+                                callback: async () => {
+                                    try {
+                                        await api.v1.ui.updateParts([{
+                                            id: "test-status",
+                                            text: "Refreshing fingerprints..."
+                                        }]);
+
+                                        // Get current document
+                                        const sections: DocumentSections = await api.v1.document.scan();
+                                        const fullText = sections.map(s => s.section.text).join('\\n');
+                                        const chapters: string[] = splitIntoChapters(fullText);
+
+                                        // Get existing fingerprints to preserve chapter numbers
+                                        const existingFps: ChapterFingerprint[] = await getChapterFingerprints();
+                                        let updatedCount = 0;
+
+                                        for (const fp of existingFps) {
+                                            // Get current chapter text
+                                            let chapterText: string;
+                                            if (fp.chapterNumber === 1) {
+                                                chapterText = chapters[0] || "";
+                                            } else {
+                                                const chapterIndex = fp.chapterNumber - 1;
+                                                chapterText = chapters[chapterIndex] || "";
+                                            }
+
+                                            if (chapterText) {
+                                                const newHash = hashString(chapterText);
+                                                fp.textHash = newHash;
+                                                fp.summaryCreatedAt = Date.now();
+                                                // Preserve isCondensed flag
+                                                updatedCount++;
+                                            }
+                                        }
+
+                                        await api.v1.storyStorage.set("chapterFingerprints", existingFps);
+
+                                        await api.v1.ui.updateParts([{
+                                            id: "test-status",
+                                            text: `✓ Refreshed ${updatedCount} fingerprints with current chapter hashes.\\n\\n⚠️ This resets detection - all chapters will appear unchanged until you edit them again.`
+                                        }]);
+
+                                        api.v1.log(`Refreshed ${updatedCount} fingerprints`);
+                                    } catch (error) {
+                                        const errorMsg = error instanceof Error ? error.message : String(error);
+                                        await api.v1.ui.updateParts([{
+                                            id: "test-status",
+                                            text: `✗ Refresh failed: ${errorMsg}`
+                                        }]);
+                                    }
+                                },
+                                style: { marginRight: "8px" }
+                            }
+                        ]
+                    },
+                    {
+                        type: "text",
+                        text: "**Backup Functions:**",
+                        markdown: true,
+                        style: { marginBottom: "4px", marginTop: "12px", fontSize: "0.9em" }
                     },
                     {
                         type: "row",
@@ -3747,7 +4912,7 @@ const onContextBuiltHook: OnContextBuilt = async (params) => {
     await api.v1.ui.register([{
         type: "scriptPanel",
         id: "chapter-summaries-panel",
-        name: "Chapter Summaries v1.3.2",
+        name: `Chapter Summaries v${SCRIPT_VERSION}`,
         iconId: "file-text",
         content: panelContent
     }]);
