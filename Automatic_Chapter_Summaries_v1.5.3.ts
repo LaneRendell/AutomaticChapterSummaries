@@ -1,7 +1,26 @@
-// Chapter Summarize v1.5.2: Fixed automatic processing behavior
+// Chapter Summarize v1.5.3: Manual condensation controls
 // At scene breaks, or new chapters this script will use GLM to summarize the content of the previous chapter,
 // add it as Lorebook entry and set it to always on.
 // Includes automatic token management, condensation, automatic change detection, and auto-regeneration.
+
+// CHANGELOG v1.5.3:
+// - [NEW FEATURE] Manual "Condense Again" functionality
+//   * New showCondensationSettingsModal() allows re-condensing with different prompts or token settings
+//   * Can adjust condensation prompt and max tokens per modal
+//   * Applies to all existing chapter summaries (re-condenses entire lorebook)
+// - [NEW FEATURE] Manual range-specific condensation
+//   * New manualCondenseRange() function to condense specific chapter ranges
+//   * showManualCondenseModal() provides UI for selecting start/end chapters
+//   * User picks exactly which chapters to condense together
+//   * Useful for consolidating specific story arcs or sections
+// - [NEW FEATURE] "Condense With Settings" button in UI
+//   * Opens modal for custom condensation prompt and max tokens
+//   * Settings saved per-session for convenience
+//   * Can test different condensation strategies without changing script config
+// - [NEW FEATURE] "Condense Range" button in UI
+//   * Opens modal for selecting chapter range to condense manually
+//   * Validates chapter numbers and range validity
+//   * Prevents overlapping with existing condensed ranges
 
 // CHANGELOG v1.5.2:
 // - [CRITICAL BUG FIX] Fixed automatic chapter processing overriding manual control
@@ -339,7 +358,7 @@ const DEBUG_MODE: boolean = true;
 const MAX_RETRIES: number = 5;
 const RETRY_DELAYS: number[] = [1000, 2000, 3000, 4000, 5000]; // Progressive backoff
 const EDITOR_READY_TIMEOUT: number = 15000; // 15 seconds max wait
-const SCRIPT_VERSION: string = api.v1.script.version // Script version number
+const SCRIPT_VERSION: string = "1.5.3" // Script version number
 
 // Configuration Schema variables
 let chapterBreakToken: string = "";
@@ -1028,6 +1047,23 @@ async function buildCondensedRangesUI(): Promise<UIPart[]> {
     // Check if undo is available
     const undoData: UndoCondenseData | null = await api.v1.storyStorage.get("lastUndoData");
     
+    // v1.5.3: Check if undo would create an overlap
+    let undoWouldOverlap = false;
+    let conflictingRange: CondensedRange | null = null;
+    if (undoData && undoData.condensedEntry) {
+        const rangeMatch = undoData.condensedEntry.displayName?.match(/Chapters (\d+)-(\d+)/);
+        if (rangeMatch) {
+            const undoStart = parseInt(rangeMatch[1]);
+            const undoEnd = parseInt(rangeMatch[2]);
+            
+            conflictingRange = condensedRanges.find(existing => {
+                return !(undoEnd < existing.startChapter || undoStart > existing.endChapter);
+            }) || null;
+            
+            undoWouldOverlap = conflictingRange !== null;
+        }
+    }
+    
     // Header
     const headerText = condensedRanges.length > 0 
         ? `**📦 Condensed Ranges (${condensedRanges.length})**\n\nThese chapter groups have been condensed to save tokens.`
@@ -1040,17 +1076,56 @@ async function buildCondensedRangesUI(): Promise<UIPart[]> {
         style: { marginBottom: "8px" }
     });
     
+    // v1.5.3: Show warning if undo would create overlap
+    if (undoData && undoData.condensedEntry && undoWouldOverlap && conflictingRange) {
+        const rangeMatch = undoData.condensedEntry.displayName?.match(/Chapters (\d+)-(\d+)/);
+        const undoRangeText = rangeMatch ? `Chapters ${rangeMatch[1]}-${rangeMatch[2]}` : "the range";
+        const conflictText = conflictingRange.startChapter === conflictingRange.endChapter 
+            ? `Chapter ${conflictingRange.startChapter}` 
+            : `Chapters ${conflictingRange.startChapter}-${conflictingRange.endChapter}`;
+        
+        content.push({
+            type: "text",
+            text: `⚠️ **Undo Blocked:** Cannot restore ${undoRangeText} because it would overlap with ${conflictText}. Uncondense the conflicting range below to enable undo.`,
+            markdown: true,
+            style: {
+                marginBottom: "12px",
+                padding: "8px",
+                backgroundColor: "rgba(255, 165, 0, 0.2)",
+                borderRadius: "4px",
+                borderLeft: "3px solid rgba(255, 165, 0, 0.6)",
+                fontSize: "0.9em"
+            }
+        });
+    }
+    
     // Undo button if available (show even when no ranges exist)
     if (undoData && undoData.condensedEntry) {
-        content.push({
-            type: "button",
-            text: "⏪ Undo Last Uncondense",
-            iconId: "reload",
-            callback: async () => {
-                await undoLastUncondense();
-            },
-            style: { marginBottom: "12px", fontSize: "0.9em" }
-        });
+        if (undoWouldOverlap) {
+            // Show disabled button with explanation
+            content.push({
+                type: "text",
+                text: "⏪ **Undo Last Uncondense** (disabled - see warning above)",
+                markdown: true,
+                style: { 
+                    marginBottom: "12px", 
+                    fontSize: "0.9em",
+                    opacity: "0.5",
+                    fontStyle: "italic"
+                }
+            });
+        } else {
+            // Show active button
+            content.push({
+                type: "button",
+                text: "⏪ Undo Last Uncondense",
+                iconId: "reload",
+                callback: async () => {
+                    await undoLastUncondense();
+                },
+                style: { marginBottom: "12px", fontSize: "0.9em" }
+            });
+        }
     }
     
     // If no ranges, return early after showing undo button (if available)
@@ -1317,9 +1392,12 @@ async function uncondenseEntireRange(range: CondensedRange): Promise<void> {
             await api.v1.lorebook.createEntry({
                 id: newEntryId,
                 displayName: displayName,
-                keys: [`chapter ${original.chapterNumber}`, `chapter${original.chapterNumber}`],
+                keys: undefined,
                 text: original.text,
                 enabled: true,
+                hidden: false,
+                forceActivation: true,
+                advancedConditions: undefined,
                 category: categoryId
             });
             
@@ -1412,11 +1490,21 @@ async function undoLastUncondense(): Promise<void> {
             }
         }
 
+        // v1.5.3: Check for overlapping ranges before restoring
+        const condensedRanges: CondensedRange[] = await api.v1.storyStorage.get("condensedRanges") || [];
+        
+        // Check if restoring this range would create an overlap
+        const wouldOverlap = condensedRanges.some(existing => {
+            // Ranges overlap if they're not completely separate
+            return !(endChapter < existing.startChapter || startChapter > existing.endChapter);
+        });
+        
+        if (wouldOverlap) {
+            throw new Error(`Cannot undo: Restoring Chapters ${startChapter}-${endChapter} would overlap with an existing condensed range. Please uncondense the conflicting range first.`);
+        }
+        
         // Restore the condensed entry
         await api.v1.lorebook.createEntry(entry);
-
-        // Restore to condensedRanges array
-        const condensedRanges: CondensedRange[] = await api.v1.storyStorage.get("condensedRanges") || [];
         
         // Count tokens for the restored condensed entry
         const tokens = await api.v1.tokenizer.encode(entry.text || "", "glm-4-6");
@@ -4418,7 +4506,7 @@ async function dismissAutoDetectionNotification(): Promise<void> {
  */
 async function waitForEditorReady(maxWaitMs: number = EDITOR_READY_TIMEOUT): Promise<boolean> {
     const startTime: number = Date.now();
-    const checkInterval: number = 100;
+    const checkInterval: number = 50;
 
     if (DEBUG_MODE) {
         api.v1.log("Waiting for editor to be ready...");
@@ -4638,7 +4726,19 @@ async function condenseSummaries(entriesToCondense: ChapterSummaryEntry[], conde
         return `${e.title}:\n${e.text}\n`;
     }).join("\n");
 
-    const condensationPrompt = `You are condensing multiple chapter summaries into a single coherent summary.
+    // v1.5.3: Check for custom temp settings
+    const tempPromptTemplate = await api.v1.storyStorage.get("tempCondensePrompt");
+    const tempMaxTokens = await api.v1.storyStorage.get("tempCondenseMaxTokens");
+    
+    let condensationPrompt: string;
+    if (tempPromptTemplate) {
+        // Replace placeholders in custom prompt
+        condensationPrompt = tempPromptTemplate
+            .replace(/\{title\}/g, condensedTitle)
+            .replace(/\{summaries\}/g, summaryTexts);
+    } else {
+        // Use default prompt
+        condensationPrompt = `You are condensing multiple chapter summaries into a single coherent summary.
 
 Original Chapters: ${condensedTitle}
 
@@ -4646,6 +4746,7 @@ Chapter Summaries:
 ${summaryTexts}
 
 Provide a concise narrative summary that captures the key plot points, character developments, and important events across these chapters. Maximum length: 3-4 sentences.`;
+    }
 
     const messages: Message[] = [{
         role: "user",
@@ -4653,7 +4754,7 @@ Provide a concise narrative summary that captures the key plot points, character
     }];
 
     let generatedSummaryParams = await api.v1.generationParameters.get();
-    generatedSummaryParams.max_tokens = summaryMaxtokens;
+    generatedSummaryParams.max_tokens = tempMaxTokens || summaryMaxtokens;
 
     // v1.4.1: Increment generation counter for condensation
     generationCounter++;
@@ -5186,6 +5287,416 @@ async function manualCondense(): Promise<void> {
             text: `✗ Condensation failed: ${errorMsg}`
         }]);
     }
+}
+
+/**
+ * v1.5.3: Show condensation settings modal for manual "condense again" with custom settings
+ */
+async function showCondensationSettingsModal(): Promise<void> {
+    // Get current entries to show token count
+    const entries = await getChapterSummaryEntries();
+    const totalTokens = await getTotalSummaryTokens();
+    const currentMaxTokens = await api.v1.config.get("max_total_summary_tokens") || maxTotalSummaryTokens;
+    const currentThresholdPercent = await api.v1.config.get("condensation_threshold") || condensationThreshold;
+
+    // Default values from config
+    const defaultMaxTokens = summaryMaxtokens;
+    
+    const defaultPrompt = `You are condensing multiple chapter summaries into a single coherent summary.
+
+Original Chapters: {title}
+
+Chapter Summaries:
+{summaries}
+
+Provide a concise narrative summary that captures the key plot points, character developments, and important events across these chapters. Maximum length: 3-4 sentences.`;
+
+    // Track input values
+    let customPrompt = defaultPrompt;
+    let customMaxTokens = defaultMaxTokens;
+    
+    // Build status message
+    const threshold = currentMaxTokens * (currentThresholdPercent / 100);
+    const overThreshold = totalTokens > threshold;
+    const statusIcon = overThreshold ? "⚠️" : "✓";
+    const statusMsg = overThreshold 
+        ? `Over threshold (${threshold} tokens) - condensation will run`
+        : `Below threshold (${threshold} tokens) - condensation may not run`;
+
+    const modal = api.v1.ui.modal.open({
+        title: "Re-Condense With Custom Settings",
+        size: "large",
+        content: [
+            {
+                type: "text",
+                text: `## ⚠️ What This Does:\n\nThis triggers the **normal automatic condensation process** with your custom prompt/token settings for this session only.\n\n**The automatic process will:**\n1. Check if you're over the threshold\n2. If yes, condense oldest chapters first (keeping recent chapters detailed)\n3. Use **your custom settings** for the condensation generation\n\n**This does NOT:**\n• Re-condense existing condensed ranges with new settings\n• Let you choose which specific chapters to condense\n\n**For those options, use:**\n• "Condense Range" button to manually condense specific chapters\n• "Uncondense" buttons in the Condensed Ranges section to expand ranges, then they'll be re-condensed with new settings\n\n---\n\n**Current Status:**\n• Total chapters: ${entries.length}\n• Total tokens: ${totalTokens}/${currentMaxTokens}\n• ${statusIcon} ${statusMsg}`,
+                markdown: true,
+                style: {
+                    marginBottom: "12px",
+                    padding: "12px",
+                    backgroundColor: "rgba(100, 150, 255, 0.1)",
+                    borderRadius: "4px",
+                    borderLeft: "3px solid rgba(100, 150, 255, 0.5)"
+                }
+            },
+            {
+                type: "text",
+                text: "**Condensation Prompt:**",
+                markdown: true,
+                style: { marginBottom: "8px", marginTop: "16px" }
+            },
+            {
+                type: "multilineTextInput",
+                id: "condense-prompt-input",
+                initialValue: defaultPrompt,
+                placeholder: "Enter condensation prompt...",
+                onChange: (value: string) => {
+                    customPrompt = value;
+                },
+                style: { marginBottom: "16px", fontFamily: "monospace", fontSize: "0.9em", minHeight: "150px" }
+            },
+            {
+                type: "text",
+                text: `**Max Tokens per Condensed Summary:** (current: ${defaultMaxTokens})`,
+                markdown: true,
+                style: { marginBottom: "8px" }
+            },
+            {
+                type: "numberInput",
+                id: "condense-maxtokens-input",
+                initialValue: defaultMaxTokens,
+                placeholder: String(defaultMaxTokens),
+                onChange: (value: string) => {
+                    customMaxTokens = parseInt(value) || defaultMaxTokens;
+                },
+                style: { marginBottom: "16px", width: "200px" }
+            },
+            {
+                type: "text",
+                text: "_Note: These settings apply only to this condensation operation and are not saved to config._",
+                markdown: true,
+                style: {
+                    fontSize: "0.85em",
+                    fontStyle: "italic",
+                    color: "rgba(255, 255, 255, 0.6)",
+                    marginBottom: "16px"
+                }
+            },
+            {
+                type: "row",
+                spacing: "end",
+                content: [
+                    {
+                        type: "button",
+                        text: "Cancel",
+                        callback: async () => {
+                            modal.close();
+                        },
+                        style: { marginRight: "8px" }
+                    },
+                    {
+                        type: "button",
+                        text: "Re-Condense All",
+                        iconId: "zap",
+                        callback: async () => {
+                            if (!customPrompt || customPrompt.trim().length === 0) {
+                                api.v1.ui.larry.help({
+                                    question: "Condensation prompt cannot be empty.",
+                                    options: [{ text: "OK", callback: () => {} }]
+                                });
+                                return;
+                            }
+
+                            if (isNaN(customMaxTokens) || customMaxTokens < 50 || customMaxTokens > 1000) {
+                                api.v1.ui.larry.help({
+                                    question: "Max tokens must be between 50 and 1000.",
+                                    options: [{ text: "OK", callback: () => {} }]
+                                });
+                                return;
+                            }
+
+                            modal.close();
+
+                            // Store custom settings temporarily
+                            await api.v1.storyStorage.set("tempCondensePrompt", customPrompt);
+                            await api.v1.storyStorage.set("tempCondenseMaxTokens", customMaxTokens);
+
+                            await api.v1.ui.updateParts([{
+                                id: "condensation-status",
+                                text: "Re-condensing with custom settings..."
+                            }]);
+
+                            try {
+                                // Run condensation with custom settings flag
+                                await checkAndCondenseIfNeeded();
+
+                                // Clear temp settings
+                                await api.v1.storyStorage.remove("tempCondensePrompt");
+                                await api.v1.storyStorage.remove("tempCondenseMaxTokens");
+
+                                await api.v1.ui.updateParts([{
+                                    id: "condensation-status",
+                                    text: "✓ Re-condensation complete!"
+                                }]);
+                            } catch (error) {
+                                const errorMsg = error instanceof Error ? error.message : String(error);
+                                await api.v1.ui.updateParts([{
+                                    id: "condensation-status",
+                                    text: `✗ Re-condensation failed: ${errorMsg}`
+                                }]);
+
+                                // Clear temp settings on error
+                                await api.v1.storyStorage.remove("tempCondensePrompt");
+                                await api.v1.storyStorage.remove("tempCondenseMaxTokens");
+                            }
+                        }
+                    }
+                ]
+            }
+        ]
+    });
+}
+
+/**
+ * v1.5.3: Show manual range condensation modal
+ */
+async function showManualCondenseModal(): Promise<void> {
+    // Get lorebook entries and find the highest chapter number
+    const lorebookEntries = await api.v1.lorebook.entries(lorebookCategoryId);
+    
+    if (lorebookEntries.length === 0) {
+        api.v1.ui.larry.help({
+            question: "No chapter summaries found. Generate some chapter summaries first before condensing.",
+            options: [{ text: "OK", callback: () => {} }]
+        });
+        return;
+    }
+    
+    // Find highest chapter number by parsing entry text (first line)
+    let highestChapter = 0;
+    for (const entry of lorebookEntries) {
+        if (!entry.text) continue;
+        
+        // Get first line of entry text
+        const firstLine = entry.text.split('\n')[0].trim();
+        
+        // Match patterns: "Chapter 4" or "Chapters 4-6"
+        const match = firstLine.match(/^Chapters?\s+(\d+)(?:-(\d+))?/i);
+        if (match) {
+            const startNum = parseInt(match[1]);
+            const endNum = match[2] ? parseInt(match[2]) : startNum;
+            if (endNum > highestChapter) {
+                highestChapter = endNum;
+            }
+        }
+    }
+    
+    if (DEBUG_MODE) {
+        api.v1.log(`Found ${lorebookEntries.length} lorebook entries, highest chapter: ${highestChapter}`);
+    }
+    
+    if (highestChapter === 0) {
+        api.v1.ui.larry.help({
+            question: "Could not determine chapter numbers from lorebook entries. Make sure entries have proper format with 'Chapter N' on the first line.",
+            options: [{ text: "OK", callback: () => {} }]
+        });
+        return;
+    }
+    
+    if (highestChapter === 1) {
+        api.v1.ui.larry.help({
+            question: "Only 1 chapter summary exists. You need at least 2 chapters to condense a range.",
+            options: [{ text: "OK", callback: () => {} }]
+        });
+        return;
+    }
+    
+    const totalCompleteChapters = highestChapter;
+
+    // Get existing condensed ranges to check for overlaps
+    const existingRanges = await api.v1.storyStorage.get("condensedRanges") || [];
+    
+    // Track input values
+    let startChapter = 1;
+    let endChapter = totalCompleteChapters;
+
+    const modal = api.v1.ui.modal.open({
+        title: "Condense Specific Range",
+        size: "medium",
+        content: [
+            {
+                type: "text",
+                text: `**Complete Chapters:** ${totalCompleteChapters}\n\nSelect a range of chapters to condense into a single summary. This is useful for consolidating specific story arcs or sections.\n\n_Note: Only complete chapters with summaries can be condensed. Chapters in progress are not included._`,
+                markdown: true,
+                style: {
+                    marginBottom: "16px",
+                    padding: "12px",
+                    backgroundColor: "rgba(100, 255, 150, 0.1)",
+                    borderRadius: "4px",
+                    borderLeft: "3px solid rgba(100, 255, 150, 0.5)"
+                }
+            },
+            {
+                type: "text",
+                text: "**Start Chapter:**",
+                markdown: true,
+                style: { marginBottom: "8px", marginTop: "16px" }
+            },
+            {
+                type: "numberInput",
+                id: "condense-start-chapter",
+                initialValue: 1,
+                placeholder: "1",
+                onChange: (value: string) => {
+                    startChapter = parseInt(value) || 1;
+                },
+                style: { marginBottom: "16px", width: "100px" }
+            },
+            {
+                type: "text",
+                text: "**End Chapter:**",
+                markdown: true,
+                style: { marginBottom: "8px" }
+            },
+            {
+                type: "numberInput",
+                id: "condense-end-chapter",
+                initialValue: totalCompleteChapters,
+                placeholder: String(totalCompleteChapters),
+                onChange: (value: string) => {
+                    endChapter = parseInt(value) || totalCompleteChapters;
+                },
+                style: { marginBottom: "16px", width: "100px" }
+            },
+            {
+                type: "text",
+                text: "_Example: Start=3, End=7 will condense chapters 3, 4, 5, 6, 7 into \"Chapters 3-7\"_",
+                markdown: true,
+                style: {
+                    fontSize: "0.85em",
+                    fontStyle: "italic",
+                    color: "rgba(255, 255, 255, 0.6)",
+                    marginBottom: "16px"
+                }
+            },
+            {
+                type: "row",
+                spacing: "end",
+                content: [
+                    {
+                        type: "button",
+                        text: "Cancel",
+                        callback: async () => {
+                            modal.close();
+                        },
+                        style: { marginRight: "8px" }
+                    },
+                    {
+                        type: "button",
+                        text: "Condense Range",
+                        iconId: "folder-plus",
+                        callback: async () => {
+                            // Validation
+                            if (isNaN(startChapter) || isNaN(endChapter)) {
+                                api.v1.ui.larry.help({
+                                    question: "Please enter valid chapter numbers.",
+                                    options: [{ text: "OK", callback: () => {} }]
+                                });
+                                return;
+                            }
+
+                            if (startChapter < 1 || startChapter > totalCompleteChapters || endChapter < 1 || endChapter > totalCompleteChapters) {
+                                api.v1.ui.larry.help({
+                                    question: `Chapter numbers must be between 1 and ${totalCompleteChapters}.`,
+                                    options: [{ text: "OK", callback: () => {} }]
+                                });
+                                return;
+                            }
+
+                            if (startChapter >= endChapter) {
+                                api.v1.ui.larry.help({
+                                    question: "Start chapter must be less than end chapter. Need at least 2 chapters to condense.",
+                                    options: [{ text: "OK", callback: () => {} }]
+                                });
+                                return;
+                            }
+
+                            // Check for overlaps with existing condensed ranges
+                            const overlaps = existingRanges.some((range: CondensedRange) => {
+                                return !(endChapter < range.startChapter || startChapter > range.endChapter);
+                            });
+
+                            if (overlaps) {
+                                api.v1.ui.larry.help({
+                                    question: `The range ${startChapter}-${endChapter} overlaps with an existing condensed range. Please uncondense the existing range first, or choose a different range.`,
+                                    options: [{ text: "OK", callback: () => {} }]
+                                });
+                                return;
+                            }
+
+                            modal.close();
+
+                            await api.v1.ui.updateParts([{
+                                id: "condensation-status",
+                                text: `Condensing chapters ${startChapter}-${endChapter}...`
+                            }]);
+
+                            try {
+                                await manualCondenseRange(startChapter, endChapter);
+
+                                await api.v1.ui.updateParts([{
+                                    id: "condensation-status",
+                                    text: `✓ Condensed chapters ${startChapter}-${endChapter}!`
+                                }]);
+
+                                await updateStatusPanel();
+                            } catch (error) {
+                                const errorMsg = error instanceof Error ? error.message : String(error);
+                                await api.v1.ui.updateParts([{
+                                    id: "condensation-status",
+                                    text: `✗ Condensation failed: ${errorMsg}`
+                                }]);
+                            }
+                        }
+                    }
+                ]
+            }
+        ]
+    });
+}
+
+/**
+ * v1.5.3: Manually condense a specific range of chapters
+ */
+async function manualCondenseRange(startChapter: number, endChapter: number): Promise<void> {
+    api.v1.log(`Manual condensation of chapters ${startChapter}-${endChapter}`);
+
+    // Get all entries
+    const allEntries = await getChapterSummaryEntries();
+
+    // Filter entries for the specified range
+    const entriesToCondense = allEntries.filter(entry => {
+        return entry.chapterNumber >= startChapter && entry.chapterNumber <= endChapter;
+    });
+
+    if (entriesToCondense.length === 0) {
+        throw new Error(`No chapter summaries found for range ${startChapter}-${endChapter}`);
+    }
+
+    if (entriesToCondense.length < 2) {
+        throw new Error("Need at least 2 chapters to condense");
+    }
+
+    // Sort by chapter number
+    entriesToCondense.sort((a, b) => a.chapterNumber - b.chapterNumber);
+
+    // Generate condensed title
+    const condensedTitle = `Chapters ${startChapter}-${endChapter}`;
+
+    // Condense them
+    await condenseSummaries(entriesToCondense, condensedTitle);
+
+    api.v1.log(`✓ Manual condensation complete: ${condensedTitle}`);
 }
 
 /**
@@ -6338,6 +6849,32 @@ const onContextBuiltHook: OnContextBuilt = async (params) => {
                             // v1.4.0: Reset generation counter when UI callback triggered
                             generationCounter = 0;
                             await manualCondense();
+                        }
+                    }
+                ]
+            },
+            // v1.5.3: Manual condensation controls
+            {
+                type: "row",
+                spacing: "start",
+                content: [
+                    {
+                        type: "button",
+                        text: "Condense With Settings",
+                        iconId: "settings",
+                        callback: async () => {
+                            generationCounter = 0;
+                            await showCondensationSettingsModal();
+                        },
+                        style: { marginRight: "8px" }
+                    },
+                    {
+                        type: "button",
+                        text: "Condense Range",
+                        iconId: "folder-plus",
+                        callback: async () => {
+                            generationCounter = 0;
+                            await showManualCondenseModal();
                         }
                     }
                 ]
