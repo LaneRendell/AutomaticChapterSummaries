@@ -1292,11 +1292,11 @@ Script uses NovelAI's `storyStorage` for persistent data:
 - **v1.5.0** (2025-11): Backup browser and retention system
 - **v1.4.1** (2025-11): Generation limits, token warnings, bug fixes
 - **v1.4.0** (2025-11): Auto-detection and auto-regeneration
-- **v1.3.2** (2025-10): Full rebuild improvements
-- **v1.3.1** (2025-10): Changed chapters UI enhancements
-- **v1.3.0** (2025-10): Chapter fingerprinting and change detection
-- **v1.2.2** (2025-10): Fixed chapter break detection
-- **v1.2.1** (2025-10): Concurrency handling
+- **v1.3.2** (2025-11): Full rebuild improvements
+- **v1.3.1** (2025-11): Changed chapters UI enhancements
+- **v1.3.0** (2025-11): Chapter fingerprinting and change detection
+- **v1.2.2** (2025-11): Fixed chapter break detection
+- **v1.2.1** (2025-11): Concurrency handling
 
 ---
 
@@ -1334,4 +1334,4 @@ Script uses NovelAI's `storyStorage` for persistent data:
 
 *For latest updates and changelog, see CHANGELOG_v1.5.3.md*  
 *For release announcement, see DISCORD_ANNOUNCEMENT_v1.5.3.md*  
-*For source code, visit: https://github.com/LaneLearns/AutomaticChapterSummaries*
+*For source code, visit: https://github.com/LaneRendell/AutomaticChapterSummaries*
