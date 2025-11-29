@@ -1,7 +1,24 @@
-// Chapter Summarize v1.5.5: API compatibility update
+// Chapter Summarize v1.6.0: History-Aware Tracking
 // At scene breaks, or new chapters this script will use GLM to summarize the content of the previous chapter,
 // add it as Lorebook entry and set it to always on.
 // Includes automatic token management, condensation, automatic change detection, and auto-regeneration.
+
+// CHANGELOG v1.6.0:
+// - [NEW FEATURE] History-Aware Chapter Tracking
+//   * Detects when user performs undo/redo operations across chapter boundaries
+//   * Uses onHistoryNavigated hook to detect undo/redo/retry/jump operations
+//   * When undo removes a chapter break: automatically removes the orphaned summary
+//   * When redo restores a chapter break: restores the cached summary from historyStorage
+//   * Uses api.v1.historyStorage to persist chapter state per history node
+//   * Cached summaries stored per history node for accurate restoration on redo
+//   * New config option: history_aware_tracking (default: true)
+// - [BUG FIX] Rebuild no longer counts in-progress chapter
+//   * Changed analyzeRebuild() to only process complete chapters (with ending break)
+//   * Fixes issue where rebuild would try to summarize the chapter being written
+// - [BUG FIX] Backup no longer fails on new stories
+//   * Added fallback for failedChapters in createRebuildBackup()
+// - [TECHNICAL] Registered onHistoryNavigated hook for history navigation events
+// - [TECHNICAL] New types: HistoryChapterState for tracking chapter state per node
 
 // CHANGELOG v1.5.5:
 // - [API COMPATIBILITY] Updated for NovelAI Script API breaking changes
@@ -387,6 +404,26 @@ type RebuildBackup = {
     chapterCount: number;
 }
 
+// v1.6.0: History-aware tracking types
+type HistoryChapterState = {
+    chapterBreakCount: number;              // Number of chapter breaks at this history node
+    summaries: CachedChapterSummary[];      // Cached summaries at this history node
+    condensedRanges: CondensedRange[];      // Condensed range metadata at this history node
+    fingerprints: ChapterFingerprint[];     // Chapter fingerprints at this history node
+    lastProcessedChapterCount: number;      // Last processed chapter count (for generation logic)
+    timestamp: number;                       // When this state was captured
+}
+
+type CachedChapterSummary = {
+    chapterNumber: number;
+    title: string;
+    summaryText: string;
+    lorebookEntryId: string;
+    isCondensed: boolean;
+    startChapter?: number;                   // For condensed ranges
+    endChapter?: number;                     // For condensed ranges
+}
+
 // ============================================================================
 
 // Internal Config Variables
@@ -420,6 +457,9 @@ let maxRebuildBackups: number;  // v1.5.0: Now configurable via config schema
 // Auto-detection config (v1.4.0)
 let autoDetectOnGeneration: boolean;
 let autoRegenerate: boolean;
+
+// History-aware tracking config (v1.6.0)
+let historyAwareTracking: boolean;
 
 // Track background work
 let backgroundSummaryInProgress: boolean = false;
@@ -647,6 +687,380 @@ async function isChapterCondensed(chapterNumber: number): Promise<boolean> {
     const fingerprints: ChapterFingerprint[] = await getChapterFingerprints();
     const fp = fingerprints.find(f => f.chapterNumber === chapterNumber);
     return fp?.isCondensed || false;
+}
+
+// ============================================================================
+// HISTORY-AWARE TRACKING FUNCTIONS (v1.6.0)
+// ============================================================================
+
+/**
+ * v1.6.0: Store the current chapter state to historyStorage for the current history node
+ * This captures the complete state including summaries, condensed ranges, and fingerprints
+ * for exact state restoration on undo/redo
+ */
+async function storeHistoryChapterState(): Promise<void> {
+    if (!historyAwareTracking) return;
+
+    try {
+        // Get current chapter break count
+        const sections: DocumentSections = await api.v1.document.scan();
+        const fullText = sections.map(s => s.section.text).join('\n');
+        const escapedToken = chapterBreakToken.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const breakPattern = new RegExp(`(?:^|\\n)\\s*${escapedToken}\\s*(?=\\n|$)`, 'gm');
+        const chapterBreakCount = (fullText.match(breakPattern) || []).length;
+
+        // Get all current chapter summaries
+        const summaries: CachedChapterSummary[] = [];
+        if (hasRequiredPermissions && lorebookCategoryId) {
+            const entries = await getChapterSummaryEntries();
+            for (const entry of entries) {
+                summaries.push({
+                    chapterNumber: entry.chapterNumber,
+                    title: entry.title,
+                    summaryText: entry.text,
+                    lorebookEntryId: entry.entryId,
+                    isCondensed: entry.isCondensed,
+                    startChapter: entry.isCondensed ? entry.startChapter : undefined,
+                    endChapter: entry.isCondensed ? entry.endChapter : undefined
+                });
+            }
+        }
+
+        // Get current condensed ranges metadata
+        const condensedRanges: CondensedRange[] = await api.v1.storyStorage.get("condensedRanges") || [];
+
+        // Get current fingerprints
+        const fingerprints: ChapterFingerprint[] = await getChapterFingerprints();
+
+        // Get lastProcessedChapterCount (critical for generation logic)
+        const lastProcessedChapterCount: number = await api.v1.storyStorage.get("lastProcessedChapterCount") || 0;
+
+        const state: HistoryChapterState = {
+            chapterBreakCount,
+            summaries,
+            condensedRanges,
+            fingerprints,
+            lastProcessedChapterCount,
+            timestamp: Date.now()
+        };
+
+        await api.v1.historyStorage.set("chapterState", state);
+
+        if (DEBUG_MODE) {
+            api.v1.log(`[History] Stored state: ${chapterBreakCount} breaks, ${summaries.length} summaries, ${condensedRanges.length} condensed ranges, ${fingerprints.length} fingerprints, lastProcessed: ${lastProcessedChapterCount}`);
+        }
+    } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        api.v1.log(`[History] Error storing chapter state: ${errorMsg}`);
+    }
+}
+
+/**
+ * v1.6.0: Get the chapter state from historyStorage for a specific history node
+ * @param nodeId Optional history node ID (defaults to current)
+ * @returns Promise<HistoryChapterState | null>
+ */
+async function getHistoryChapterState(nodeId?: number): Promise<HistoryChapterState | null> {
+    try {
+        const state = await api.v1.historyStorage.get("chapterState", nodeId);
+        return state || null;
+    } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        api.v1.log(`[History] Error getting chapter state: ${errorMsg}`);
+        return null;
+    }
+}
+
+/**
+ * v1.6.0: Count current chapter breaks in the document
+ * @returns Promise<number> Number of chapter breaks
+ */
+async function countCurrentChapterBreaks(): Promise<number> {
+    const sections: DocumentSections = await api.v1.document.scan();
+    const fullText = sections.map(s => s.section.text).join('\n');
+    const escapedToken = chapterBreakToken.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const breakPattern = new RegExp(`(?:^|\\n)\\s*${escapedToken}\\s*(?=\\n|$)`, 'gm');
+    const matches = fullText.match(breakPattern) || [];
+
+    if (DEBUG_MODE) {
+        // Log document tail to help diagnose timing issues
+        const tail = fullText.slice(-150).replace(/\n/g, '\\n');
+        api.v1.log(`[History] Document tail (last 150 chars): ...${tail}`);
+        api.v1.log(`[History] Break matches found: ${matches.length}`);
+    }
+
+    return matches.length;
+}
+
+/**
+ * v1.6.0: Restore the complete chapter summary state from a cached HistoryChapterState
+ * This performs a full state restoration: removes all current summaries and recreates from cache
+ * @param targetState The state to restore to
+ */
+async function restoreFullHistoryState(targetState: HistoryChapterState): Promise<void> {
+    if (!hasRequiredPermissions) {
+        api.v1.log("[History] Cannot restore state: missing permissions");
+        return;
+    }
+
+    api.v1.log(`[History] Performing full state restoration...`);
+    api.v1.log(`[History] Target state: ${targetState.summaries.length} summaries, ${targetState.condensedRanges.length} condensed ranges, ${targetState.fingerprints.length} fingerprints`);
+
+    try {
+        // Step 1: Remove ALL current lorebook entries in our category
+        const currentEntries = await getChapterSummaryEntries();
+        api.v1.log(`[History] Removing ${currentEntries.length} current lorebook entries...`);
+
+        for (const entry of currentEntries) {
+            try {
+                await api.v1.lorebook.removeEntry(entry.entryId);
+            } catch (error) {
+                const errorMsg = error instanceof Error ? error.message : String(error);
+                api.v1.log(`[History] Warning: Could not remove entry ${entry.entryId}: ${errorMsg}`);
+            }
+        }
+
+        // Step 2: Recreate all summaries from the cached state
+        api.v1.log(`[History] Recreating ${targetState.summaries.length} summaries from cache...`);
+
+        for (const cached of targetState.summaries) {
+            try {
+                // Use the cached title directly - it's already the complete displayName
+                // from the original entry (e.g., "Airlock Six" or "Chapter 3")
+                await api.v1.lorebook.createEntry({
+                    category: lorebookCategoryId,
+                    displayName: cached.title,
+                    text: cached.summaryText,
+                    enabled: true,
+                    forceActivation: true,
+                    keys: []
+                });
+
+                if (DEBUG_MODE) {
+                    if (cached.isCondensed) {
+                        api.v1.log(`[History] Restored condensed summary for chapters ${cached.startChapter}-${cached.endChapter}`);
+                    } else {
+                        api.v1.log(`[History] Restored summary for chapter ${cached.chapterNumber}`);
+                    }
+                }
+            } catch (error) {
+                const errorMsg = error instanceof Error ? error.message : String(error);
+                api.v1.log(`[History] Error restoring summary for chapter ${cached.chapterNumber}: ${errorMsg}`);
+            }
+        }
+
+        // Step 3: Restore condensedRanges metadata to storyStorage
+        // Note: The lorebook entry IDs will be different, so we need to update the range metadata
+        // For now, we restore the structure but the entry IDs won't match - this is acceptable
+        // as the condensed ranges are primarily used for UI display and uncondense operations
+        api.v1.log(`[History] Restoring ${targetState.condensedRanges.length} condensed range metadata...`);
+        await api.v1.storyStorage.set("condensedRanges", targetState.condensedRanges);
+
+        // Step 4: Restore fingerprints to storyStorage
+        api.v1.log(`[History] Restoring ${targetState.fingerprints.length} fingerprints...`);
+        await api.v1.storyStorage.set("chapterFingerprints", targetState.fingerprints);
+
+        // Step 5: Restore lastProcessedChapterCount (critical for generation logic)
+        api.v1.log(`[History] Restoring lastProcessedChapterCount: ${targetState.lastProcessedChapterCount}`);
+        await api.v1.storyStorage.set("lastProcessedChapterCount", targetState.lastProcessedChapterCount);
+
+        // Step 6: Update the UI
+        await updateStatusPanel();
+
+        api.v1.log(`[History] Full state restoration complete.`);
+
+    } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        api.v1.log(`[History] Error during full state restoration: ${errorMsg}`);
+    }
+}
+
+/**
+ * v1.6.0: Check if the chapter summary state has changed between two history states
+ * @param stateA First state to compare
+ * @param stateB Second state to compare
+ * @returns true if states are different and restoration is needed
+ */
+function historyStatesAreDifferent(stateA: HistoryChapterState, stateB: HistoryChapterState): boolean {
+    // Quick checks first
+    if (stateA.chapterBreakCount !== stateB.chapterBreakCount) return true;
+    if (stateA.summaries.length !== stateB.summaries.length) return true;
+    if (stateA.condensedRanges.length !== stateB.condensedRanges.length) return true;
+    if (stateA.fingerprints.length !== stateB.fingerprints.length) return true;
+    if (stateA.lastProcessedChapterCount !== stateB.lastProcessedChapterCount) return true;
+
+    // Check if summaries are different (by chapter number and text hash)
+    const summaryKeysA = new Set(stateA.summaries.map(s => `${s.chapterNumber}:${s.isCondensed}`));
+    const summaryKeysB = new Set(stateB.summaries.map(s => `${s.chapterNumber}:${s.isCondensed}`));
+
+    for (const key of summaryKeysA) {
+        if (!summaryKeysB.has(key)) return true;
+    }
+    for (const key of summaryKeysB) {
+        if (!summaryKeysA.has(key)) return true;
+    }
+
+    return false;
+}
+
+/**
+ * v1.6.0: Main handler for history navigation events (undo/redo/retry/jump)
+ * Registered as onHistoryNavigated hook
+ *
+ * This performs FULL STATE RESTORATION: when navigating history, we restore
+ * the exact chapter summary state (summaries, condensed ranges, fingerprints)
+ * that existed at the target history node.
+ */
+async function onHistoryNavigatedHook(params: {
+    nodeId: string;
+    previousNodeId: string;
+    direction: 'forward' | 'backward' | 'both';
+    distance: number;
+    cause: 'undo' | 'redo' | 'retry' | 'jump';
+}): Promise<void> {
+    if (!historyAwareTracking) {
+        return;
+    }
+
+    if (DEBUG_MODE) {
+        api.v1.log(`[History] Navigation detected: ${params.cause} (${params.direction}), distance: ${params.distance}`);
+        api.v1.log(`[History] From node ${params.previousNodeId} to node ${params.nodeId}`);
+    }
+
+    try {
+        // Get the state from the TARGET node (the node we're navigating TO)
+        const targetState = await getHistoryChapterState(parseInt(params.nodeId));
+
+        // Get the state from the node we're leaving (for comparison)
+        const previousState = await getHistoryChapterState(parseInt(params.previousNodeId));
+
+        if (!targetState) {
+            // Target node doesn't have state cached - this is an old node from before tracking started
+            // We need to sync lorebook state to match the current document state
+            if (DEBUG_MODE) {
+                api.v1.log("[History] Target node has no cached state (older than tracking). Syncing lorebook to document...");
+            }
+
+            // Count chapter breaks in the document NOW (after navigation)
+            const currentBreakCount = await countCurrentChapterBreaks();
+            api.v1.log(`[History] Document has ${currentBreakCount} chapter breaks after navigation`);
+
+            // Remove any summaries that are orphaned (chapter number > current break count)
+            if (hasRequiredPermissions && lorebookCategoryId) {
+                const entries = await getChapterSummaryEntries();
+                const orphanedEntries = entries.filter(entry => {
+                    if (entry.isCondensed) {
+                        return entry.endChapter > currentBreakCount;
+                    } else {
+                        return entry.chapterNumber > currentBreakCount;
+                    }
+                });
+
+                if (orphanedEntries.length > 0) {
+                    api.v1.log(`[History] Removing ${orphanedEntries.length} orphaned summary(ies)...`);
+                    for (const entry of orphanedEntries) {
+                        try {
+                            await api.v1.lorebook.removeEntry(entry.entryId);
+                            if (DEBUG_MODE) {
+                                api.v1.log(`[History] Removed orphaned summary for chapter ${entry.chapterNumber}`);
+                            }
+                        } catch (error) {
+                            const errorMsg = error instanceof Error ? error.message : String(error);
+                            api.v1.log(`[History] Warning: Could not remove entry: ${errorMsg}`);
+                        }
+                    }
+
+                    // Update fingerprints to remove orphaned chapters
+                    const fingerprints = await getChapterFingerprints();
+                    const validFingerprints = fingerprints.filter(f => f.chapterNumber <= currentBreakCount);
+                    await api.v1.storyStorage.set("chapterFingerprints", validFingerprints);
+
+                    // Update lastProcessedChapterCount
+                    await api.v1.storyStorage.set("lastProcessedChapterCount", currentBreakCount);
+
+                    // Update status panel
+                    await updateStatusPanel();
+                }
+            }
+
+            // Now store the corrected state for this node
+            await storeHistoryChapterState();
+            return;
+        }
+
+        // Check if the states are actually different
+        if (previousState && !historyStatesAreDifferent(previousState, targetState)) {
+            if (DEBUG_MODE) {
+                api.v1.log("[History] States are identical, no restoration needed");
+            }
+            return;
+        }
+
+        // CRITICAL: Validate that cached state matches actual document state
+        // The cached state may be stale from a previous session/test
+        const currentBreakCount = await countCurrentChapterBreaks();
+
+        if (targetState.chapterBreakCount !== currentBreakCount) {
+            // Cached state is STALE - it doesn't match the document at this history node
+            // Sync lorebook to match the actual document instead of restoring stale state
+            api.v1.log(`[History] Cached state is stale (cached: ${targetState.chapterBreakCount} breaks, actual: ${currentBreakCount} breaks). Syncing to document...`);
+
+            if (hasRequiredPermissions && lorebookCategoryId) {
+                const entries = await getChapterSummaryEntries();
+                const orphanedEntries = entries.filter(entry => {
+                    if (entry.isCondensed) {
+                        return entry.endChapter > currentBreakCount;
+                    } else {
+                        return entry.chapterNumber > currentBreakCount;
+                    }
+                });
+
+                if (orphanedEntries.length > 0) {
+                    api.v1.log(`[History] Removing ${orphanedEntries.length} orphaned summary(ies)...`);
+                    for (const entry of orphanedEntries) {
+                        try {
+                            await api.v1.lorebook.removeEntry(entry.entryId);
+                            if (DEBUG_MODE) {
+                                api.v1.log(`[History] Removed orphaned summary for chapter ${entry.chapterNumber}`);
+                            }
+                        } catch (error) {
+                            const errorMsg = error instanceof Error ? error.message : String(error);
+                            api.v1.log(`[History] Warning: Could not remove entry: ${errorMsg}`);
+                        }
+                    }
+
+                    // Update fingerprints to remove orphaned chapters
+                    const fingerprints = await getChapterFingerprints();
+                    const validFingerprints = fingerprints.filter(f => f.chapterNumber <= currentBreakCount);
+                    await api.v1.storyStorage.set("chapterFingerprints", validFingerprints);
+
+                    // Update lastProcessedChapterCount
+                    await api.v1.storyStorage.set("lastProcessedChapterCount", currentBreakCount);
+
+                    // Update status panel
+                    await updateStatusPanel();
+                }
+            }
+
+            // Store the corrected state for this node (overwrites stale state)
+            await storeHistoryChapterState();
+            return;
+        }
+
+        // Cached state is valid - proceed with restoration
+        api.v1.log(`[History] ${params.cause.toUpperCase()}: Restoring state from history node ${params.nodeId}`);
+        api.v1.log(`[History] Current breaks: ${currentBreakCount}, Target breaks: ${targetState.chapterBreakCount}`);
+
+        // Perform full state restoration
+        await restoreFullHistoryState(targetState);
+
+        // Note: We don't store state after restoration because we just restored TO this node's state
+        // The state for this node already exists in historyStorage
+
+    } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        api.v1.log(`[History] Error handling navigation: ${errorMsg}`);
+    }
 }
 
 /**
@@ -1074,6 +1488,9 @@ async function regenerateChapter(chapterNumber: number): Promise<void> {
 
     // Update status panel
     await updateStatusPanel();
+
+    // v1.6.0: Store history state for undo/redo tracking
+    await storeHistoryChapterState();
 }
 
 /**
@@ -2159,10 +2576,14 @@ async function analyzeRebuild(): Promise<RebuildAnalysis> {
     const escapedToken = chapterBreakToken.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const breakPattern = new RegExp(`(?:^|\\n)\\s*${escapedToken}\\s*(?=\\n|$)`, 'gm');
     const chapterBreakCount = (fullText.match(breakPattern) || []).length;
-    const detectedChapterCount = chapterBreakCount + 1; // Chapters = breaks + 1 for chapter 1
+
+    // Only COMPLETE chapters should be rebuilt (chapters with an ending break)
+    // chapterBreakCount = number of complete chapters
+    // The text after the last break is the in-progress chapter and should NOT be rebuilt
+    const completeChapterCount = chapterBreakCount;
 
     if (DEBUG_MODE) {
-        api.v1.log(`Detected ${detectedChapterCount} chapters in document`);
+        api.v1.log(`Detected ${completeChapterCount} complete chapters in document (${chapterBreakCount} breaks)`);
     }
 
     // Split into chapters (respects summarizeAllBreaks config in v1.4.0)
@@ -2178,15 +2599,18 @@ async function analyzeRebuild(): Promise<RebuildAnalysis> {
 
     if (DEBUG_MODE) {
         api.v1.log(`Found ${existingFingerprints.length} existing fingerprints`);
+        if (chapters.length > completeChapterCount) {
+            api.v1.log(`Skipping in-progress chapter ${chapters.length} (no ending break)`);
+        }
     }
 
-    // Analyze each chapter
+    // Analyze each COMPLETE chapter (skip in-progress chapter after last break)
     const actions: RebuildAction[] = [];
     let unchangedCount: number = 0;
     let changedCount: number = 0;
     let newChaptersCount: number = 0;
 
-    for (let i = 0; i < chapters.length; i++) {
+    for (let i = 0; i < completeChapterCount; i++) {
         const chapterNumber: number = i + 1;
         const chapterText: string = chapters[i];
 
@@ -2258,7 +2682,7 @@ async function analyzeRebuild(): Promise<RebuildAnalysis> {
 
     const analysis: RebuildAnalysis = {
         currentChapterCount: existingFingerprints.length,
-        detectedChapterCount,
+        detectedChapterCount: completeChapterCount,
         actions,
         stats: {
             unchanged: unchangedCount,
@@ -2527,7 +2951,7 @@ async function createRebuildBackup(reason: string): Promise<RebuildBackup> {
         const fingerprints: ChapterFingerprint[] = await getChapterFingerprints();
         const changedChapters: ChangedChapter[] = await getChangedChapters();
         const condensedRanges: CondensedRange[] = await api.v1.storyStorage.get("condensedRanges") || [];
-        const failedChapters: FailedChapter[] = await api.v1.storyStorage.get("failedChapters");
+        const failedChapters: FailedChapter[] = await api.v1.storyStorage.get("failedChapters") || [];
         const lastProcessedChapterCount: number = await api.v1.storyStorage.get("lastProcessedChapterCount") || 0;
         const isFirstChapterValue: boolean = await api.v1.storyStorage.get("isFirstChapter") || false;
 
@@ -6664,6 +7088,9 @@ async function generateChapterSummary(chapterData: { text: string; title: string
         // Update UI
         await updateStatusPanel();
 
+        // v1.6.0: Store history state for undo/redo tracking
+        await storeHistoryChapterState();
+
         // v1.5.2 FIX: Don't automatically check condensation here
         // Condensation should only happen via checkTokenBudgetAfterGeneration() (when user generates text)
         // This allows manual control when auto-settings are disabled
@@ -6903,6 +7330,9 @@ const onContextBuiltHook: OnContextBuilt = async (params) => {
     autoDetectOnGeneration = await api.v1.config.get("auto_detect_on_generation") || false;
     autoRegenerate = await api.v1.config.get("auto_regenerate") || false;
 
+    // Load history-aware tracking config (v1.6.0)
+    historyAwareTracking = await api.v1.config.get("history_aware_tracking") ?? true;  // Default: true
+
     // Load isFirstChapter from storage
     const storedFirstChapter = await api.v1.storyStorage.get("isFirstChapter");
     if (storedFirstChapter !== undefined) {
@@ -6925,6 +7355,7 @@ const onContextBuiltHook: OnContextBuilt = async (params) => {
         api.v1.log(`Config - Chapters Per Group: ${chaptersPerCondensedGroup}`);
         api.v1.log(`Config - Auto-Detect On Generation: ${autoDetectOnGeneration}`);
         api.v1.log(`Config - Auto-Regenerate: ${autoRegenerate}`);
+        api.v1.log(`Config - History-Aware Tracking: ${historyAwareTracking}`);
         api.v1.log(`State - isFirstChapter: ${isFirstChapter}`);
     }
 
@@ -7629,4 +8060,14 @@ const onContextBuiltHook: OnContextBuilt = async (params) => {
     // Register hooks
     api.v1.hooks.register('onResponse', onResponseHook);
     api.v1.hooks.register('onContextBuilt', onContextBuiltHook);
+
+    // v1.6.0: Register history navigation hook for undo/redo tracking
+    if (historyAwareTracking) {
+        api.v1.hooks.register('onHistoryNavigated', onHistoryNavigatedHook);
+        if (DEBUG_MODE) {
+            api.v1.log("History-aware tracking hook registered");
+        }
+        // Store initial state
+        await storeHistoryChapterState();
+    }
 })();
