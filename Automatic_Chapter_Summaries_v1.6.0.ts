@@ -17,6 +17,10 @@
 //   * Fixes issue where rebuild would try to summarize the chapter being written
 // - [BUG FIX] Backup no longer fails on new stories
 //   * Added fallback for failedChapters in createRebuildBackup()
+// - [BUG FIX] Stale lorebook entry IDs after redo restoration
+//   * restoreFullHistoryState() now queries back newly created entries
+//   * Updates condensedRanges metadata with correct entry IDs
+//   * Fixes uncondense operations failing after history navigation
 // - [TECHNICAL] Registered onHistoryNavigated hook for history navigation events
 // - [TECHNICAL] New types: HistoryChapterState for tracking chapter state per node
 
@@ -850,11 +854,42 @@ async function restoreFullHistoryState(targetState: HistoryChapterState): Promis
         }
 
         // Step 3: Restore condensedRanges metadata to storyStorage
-        // Note: The lorebook entry IDs will be different, so we need to update the range metadata
-        // For now, we restore the structure but the entry IDs won't match - this is acceptable
-        // as the condensed ranges are primarily used for UI display and uncondense operations
+        // v1.6.0 fix: Update lorebookEntryId references to match newly created entries
         api.v1.log(`[History] Restoring ${targetState.condensedRanges.length} condensed range metadata...`);
-        await api.v1.storyStorage.set("condensedRanges", targetState.condensedRanges);
+
+        if (targetState.condensedRanges.length > 0) {
+            // Query back all newly created entries to get their IDs
+            const newEntries = await api.v1.lorebook.entries(lorebookCategoryId);
+
+            // Build a map from display name to new entry ID
+            const nameToIdMap = new Map<string, string>();
+            for (const entry of newEntries) {
+                nameToIdMap.set(entry.displayName, entry.id);
+            }
+
+            // Update condensedRanges with new entry IDs
+            const updatedRanges: CondensedRange[] = targetState.condensedRanges.map(range => {
+                // Condensed ranges use "Chapters X-Y" or "Chapter X" format
+                const expectedName = range.startChapter === range.endChapter
+                    ? `Chapter ${range.startChapter}`
+                    : `Chapters ${range.startChapter}-${range.endChapter}`;
+
+                const newEntryId = nameToIdMap.get(expectedName);
+
+                if (newEntryId && newEntryId !== range.lorebookEntryId) {
+                    if (DEBUG_MODE) {
+                        api.v1.log(`[History] Updated entry ID for "${expectedName}": ${range.lorebookEntryId} -> ${newEntryId}`);
+                    }
+                    return { ...range, lorebookEntryId: newEntryId };
+                }
+
+                return range;
+            });
+
+            await api.v1.storyStorage.set("condensedRanges", updatedRanges);
+        } else {
+            await api.v1.storyStorage.set("condensedRanges", targetState.condensedRanges);
+        }
 
         // Step 4: Restore fingerprints to storyStorage
         api.v1.log(`[History] Restoring ${targetState.fingerprints.length} fingerprints...`);

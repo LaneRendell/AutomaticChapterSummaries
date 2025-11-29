@@ -30,6 +30,9 @@ Fixed an error when creating backups on brand new stories with no content:
 Backup failed: cannot read property 'length' of undefined
 ```
 
+### Condensed Ranges Work After Redo
+Previously, after using redo to restore chapter summaries, uncondense operations could fail because the metadata had stale entry IDs. Now the script updates entry IDs correctly after history restoration.
+
 ## Installation
 
 1. Copy the script from the GitHub repo

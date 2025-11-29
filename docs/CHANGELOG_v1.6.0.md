@@ -58,6 +58,20 @@ The `failedChapters` storage retrieval was missing a fallback value, returning `
 **Solution:**
 Added `|| []` fallback to `failedChapters` retrieval in `createRebuildBackup()`.
 
+### Stale Lorebook Entry IDs After Redo
+
+**Symptom:**
+After using redo to restore chapter summaries, uncondense operations would fail or target wrong entries because the `condensedRanges` metadata contained old entry IDs.
+
+**Root Cause:**
+When `restoreFullHistoryState()` recreated lorebook entries, they received new IDs from NovelAI. The cached `condensedRanges` metadata still referenced the old entry IDs.
+
+**Solution:**
+After recreating entries, `restoreFullHistoryState()` now:
+1. Queries back all newly created entries to get their IDs
+2. Builds a map from display name to new entry ID
+3. Updates `condensedRanges` with the correct entry IDs before saving to storage
+
 ---
 
 ## Technical Changes
@@ -119,6 +133,7 @@ api.v1.hooks.register('onHistoryNavigated', onHistoryNavigatedHook);
 | History-Aware Tracking | Feature | Auto-manage summaries on undo/redo |
 | Rebuild Chapter Count | Bug Fix | No longer counts in-progress chapter |
 | Backup on New Stories | Bug Fix | Fixed undefined length error |
+| Stale Entry IDs After Redo | Bug Fix | Updates condensedRanges with correct entry IDs |
 | Stale Cache Detection | Enhancement | Validates cached state matches document |
 
 ---
@@ -162,8 +177,6 @@ After updating, you can configure the new feature in NovelAI's script configurat
 ## Known Limitations
 
 1. **Pre-Tracking History**: History nodes that existed before the script was loaded will not have cached state. Undoing to these nodes syncs lorebook to document state.
-
-2. **Lorebook Entry IDs**: When summaries are restored via redo, they receive new lorebook entry IDs. This may affect `condensedRanges` metadata with stale IDs.
 
 ---
 

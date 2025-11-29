@@ -25,6 +25,7 @@ A powerful NovelAI script that automatically generates, manages, and condenses c
 - **🕐 History-Aware Tracking** - Auto-manage summaries when using undo/redo/retry
 - **🐛 Rebuild Fix** - No longer counts in-progress chapter during rebuild
 - **🐛 Backup Fix** - Fixed backup failing on new stories
+- **🐛 Entry ID Fix** - Condensed ranges now work correctly after redo operations
 
 ### Key Capabilities
 - Detect chapter breaks automatically using configurable tokens
