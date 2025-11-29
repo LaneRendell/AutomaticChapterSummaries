@@ -864,7 +864,9 @@ async function restoreFullHistoryState(targetState: HistoryChapterState): Promis
             // Build a map from display name to new entry ID
             const nameToIdMap = new Map<string, string>();
             for (const entry of newEntries) {
-                nameToIdMap.set(entry.displayName, entry.id);
+                if (entry.displayName) {
+                    nameToIdMap.set(entry.displayName, entry.id);
+                }
             }
 
             // Update condensedRanges with new entry IDs
